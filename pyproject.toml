@@ -1,0 +1,42 @@
+[project]
+name = "hyperfuzz"
+version = "0.1.0"
+description = "High-performance string similarity algorithms implemented in Rust"
+readme = "README.md"
+authors = [
+    { name = "Adem", email = "adem.akdogan92@gmail.com" }
+]
+requires-python = ">=3.13"
+license = { text = "MIT" }
+keywords = ["string", "similarity", "fuzzy", "matching", "levenshtein", "rust"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Text Processing :: General",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "rapidfuzz>=3.0.0",
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "hyperfuzz._hyperfuzz"
+
+[dependency-groups]
+dev = [
+    "maturin>=1.11.5",
+    "pytest>=9.0.2",
+    "rapidfuzz>=3.14.3",
+]

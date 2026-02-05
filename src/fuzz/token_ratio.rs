@@ -5,10 +5,9 @@
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::cmp::max;
-use std::collections::HashSet;
 use ahash::AHashSet;
 
-/// Tokenize a string (split by whitespace, lowercase).
+/// Tokenize a string (split by whitespace).
 #[inline(always)]
 fn tokenize(s: &str) -> Vec<&str> {
     s.split_whitespace().collect()
@@ -85,7 +84,12 @@ pub fn token_sort_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
 }
 
 /// Token set ratio - compare token sets.
-/// Returns 100 if one set is subset of another.
+/// 
+/// RapidFuzz algorithm:
+/// 1. Tokenize both strings
+/// 2. Calculate intersection, difference1 (s1-s2), difference2 (s2-s1)
+/// 3. Create 3 strings: sorted_intersection, sorted_intersection + sorted_diff1, etc.
+/// 4. Return max of comparing these strings using ratio
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
@@ -95,37 +99,56 @@ pub fn token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
     if tokens1.is_empty() && tokens2.is_empty() {
         return 100.0;
     }
+    if tokens1.is_empty() || tokens2.is_empty() {
+        return 0.0;
+    }
     
-    let intersection: AHashSet<&str> = tokens1.intersection(&tokens2).copied().collect();
-    let diff1_2: AHashSet<&str> = tokens1.difference(&tokens2).copied().collect();
-    let diff2_1: AHashSet<&str> = tokens2.difference(&tokens1).copied().collect();
+    let intersection: Vec<&str> = tokens1.intersection(&tokens2).copied().collect();
+    let diff1: Vec<&str> = tokens1.difference(&tokens2).copied().collect();
+    let diff2: Vec<&str> = tokens2.difference(&tokens1).copied().collect();
     
-    let mut inter_tokens: Vec<&str> = intersection.iter().copied().collect();
-    let mut diff1_tokens: Vec<&str> = diff1_2.iter().copied().collect();
-    let mut diff2_tokens: Vec<&str> = diff2_1.iter().copied().collect();
+    // Sort all token lists
+    let mut sorted_inter = intersection.clone();
+    let mut sorted_diff1 = diff1.clone();
+    let mut sorted_diff2 = diff2.clone();
+    sorted_inter.sort_unstable();
+    sorted_diff1.sort_unstable();
+    sorted_diff2.sort_unstable();
     
-    inter_tokens.sort_unstable();
-    diff1_tokens.sort_unstable();
-    diff2_tokens.sort_unstable();
+    let inter_str = sorted_inter.join(" ");
     
-    let inter_str = inter_tokens.join(" ");
-    let combined1 = if diff1_tokens.is_empty() {
+    // Build combined strings
+    let combined1 = if sorted_diff1.is_empty() {
         inter_str.clone()
+    } else if inter_str.is_empty() {
+        sorted_diff1.join(" ")
     } else {
-        format!("{} {}", inter_str, diff1_tokens.join(" "))
+        format!("{} {}", inter_str, sorted_diff1.join(" "))
     };
-    let combined2 = if diff2_tokens.is_empty() {
+    
+    let combined2 = if sorted_diff2.is_empty() {
         inter_str.clone()
+    } else if inter_str.is_empty() {
+        sorted_diff2.join(" ")
     } else {
-        format!("{} {}", inter_str, diff2_tokens.join(" "))
+        format!("{} {}", inter_str, sorted_diff2.join(" "))
     };
     
-    // Calculate ratios
-    let r1 = ratio_internal(&inter_str, &combined1);
-    let r2 = ratio_internal(&inter_str, &combined2);
-    let r3 = ratio_internal(&combined1, &combined2);
+    // RapidFuzz compares:
+    // 1. intersection vs combined1
+    // 2. intersection vs combined2
+    // 3. combined1 vs combined2
+    // But if intersection is empty, it just falls back to regular ratio behavior
     
-    let result = r1.max(r2).max(r3);
+    let result = if inter_str.is_empty() {
+        // No common tokens, compare the full sorted token strings
+        ratio_internal(&combined1, &combined2)
+    } else {
+        let r1 = ratio_internal(&inter_str, &combined1);
+        let r2 = ratio_internal(&inter_str, &combined2);
+        let r3 = ratio_internal(&combined1, &combined2);
+        r1.max(r2).max(r3)
+    };
     
     match score_cutoff {
         Some(cutoff) if result < cutoff => 0.0,
@@ -190,5 +213,13 @@ mod tests {
     fn test_token_set_ratio() {
         let r = token_set_ratio("fuzzy was a bear", "fuzzy fuzzy was a bear", None);
         assert!((r - 100.0).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_token_set_ratio_single_words() {
+        // For single different words, should behave like ratio
+        let r = token_set_ratio("kitten", "sitting", None);
+        // 61.538... like ratio
+        assert!((r - 61.54).abs() < 0.1);
     }
 }

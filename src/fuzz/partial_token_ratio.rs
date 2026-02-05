@@ -13,56 +13,7 @@ fn tokenize(s: &str) -> Vec<&str> {
     s.split_whitespace().collect()
 }
 
-/// Calculate LCS length between two strings.
-#[inline(always)]
-fn lcs_length(s1: &str, s2: &str) -> usize {
-    let s1_chars: Vec<char> = s1.chars().collect();
-    let s2_chars: Vec<char> = s2.chars().collect();
-
-    let m = s1_chars.len();
-    let n = s2_chars.len();
-
-    if m == 0 || n == 0 {
-        return 0;
-    }
-
-    let mut prev: Vec<usize> = vec![0; n + 1];
-    let mut curr: Vec<usize> = vec![0; n + 1];
-
-    for i in 1..=m {
-        for j in 1..=n {
-            if s1_chars[i - 1] == s2_chars[j - 1] {
-                curr[j] = prev[j - 1] + 1;
-            } else {
-                curr[j] = max(prev[j], curr[j - 1]);
-            }
-        }
-        std::mem::swap(&mut prev, &mut curr);
-        curr.fill(0);
-    }
-
-    prev[n]
-}
-
-/// Calculate ratio.
-#[inline(always)]
-fn ratio_internal(s1: &str, s2: &str) -> f64 {
-    let len1 = s1.chars().count();
-    let len2 = s2.chars().count();
-    let total = len1 + len2;
-
-    if total == 0 {
-        return 100.0;
-    }
-    if s1 == s2 {
-        return 100.0;
-    }
-
-    let lcs = lcs_length(s1, s2);
-    100.0 * (2.0 * lcs as f64) / (total as f64)
-}
-
-/// Calculate partial ratio between char slices.
+/// Calculate LCS length between two char slices.
 #[inline(always)]
 fn lcs_length_chars(s1: &[char], s2: &[char]) -> usize {
     let m = s1.len();
@@ -88,6 +39,32 @@ fn lcs_length_chars(s1: &[char], s2: &[char]) -> usize {
     }
 
     prev[n]
+}
+
+/// Calculate LCS length between two strings.
+#[inline(always)]
+fn lcs_length(s1: &str, s2: &str) -> usize {
+    let s1_chars: Vec<char> = s1.chars().collect();
+    let s2_chars: Vec<char> = s2.chars().collect();
+    lcs_length_chars(&s1_chars, &s2_chars)
+}
+
+/// Calculate ratio for two strings.
+#[inline(always)]
+fn ratio_internal(s1: &str, s2: &str) -> f64 {
+    let len1 = s1.chars().count();
+    let len2 = s2.chars().count();
+    let total = len1 + len2;
+
+    if total == 0 {
+        return 100.0;
+    }
+    if s1 == s2 {
+        return 100.0;
+    }
+
+    let lcs = lcs_length(s1, s2);
+    100.0 * (2.0 * lcs as f64) / (total as f64)
 }
 
 /// Calculate partial ratio between two strings.
@@ -166,36 +143,47 @@ pub fn partial_token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) ->
     if tokens1.is_empty() && tokens2.is_empty() {
         return 100.0;
     }
+    if tokens1.is_empty() || tokens2.is_empty() {
+        return 0.0;
+    }
     
-    let intersection: AHashSet<&str> = tokens1.intersection(&tokens2).copied().collect();
-    let diff1_2: AHashSet<&str> = tokens1.difference(&tokens2).copied().collect();
-    let diff2_1: AHashSet<&str> = tokens2.difference(&tokens1).copied().collect();
+    let intersection: Vec<&str> = tokens1.intersection(&tokens2).copied().collect();
+    let diff1: Vec<&str> = tokens1.difference(&tokens2).copied().collect();
+    let diff2: Vec<&str> = tokens2.difference(&tokens1).copied().collect();
     
-    let mut inter_tokens: Vec<&str> = intersection.iter().copied().collect();
-    let mut diff1_tokens: Vec<&str> = diff1_2.iter().copied().collect();
-    let mut diff2_tokens: Vec<&str> = diff2_1.iter().copied().collect();
+    let mut sorted_inter = intersection.clone();
+    let mut sorted_diff1 = diff1.clone();
+    let mut sorted_diff2 = diff2.clone();
+    sorted_inter.sort_unstable();
+    sorted_diff1.sort_unstable();
+    sorted_diff2.sort_unstable();
     
-    inter_tokens.sort_unstable();
-    diff1_tokens.sort_unstable();
-    diff2_tokens.sort_unstable();
+    let inter_str = sorted_inter.join(" ");
     
-    let inter_str = inter_tokens.join(" ");
-    let combined1 = if diff1_tokens.is_empty() {
+    let combined1 = if sorted_diff1.is_empty() {
         inter_str.clone()
+    } else if inter_str.is_empty() {
+        sorted_diff1.join(" ")
     } else {
-        format!("{} {}", inter_str, diff1_tokens.join(" "))
+        format!("{} {}", inter_str, sorted_diff1.join(" "))
     };
-    let combined2 = if diff2_tokens.is_empty() {
+    
+    let combined2 = if sorted_diff2.is_empty() {
         inter_str.clone()
+    } else if inter_str.is_empty() {
+        sorted_diff2.join(" ")
     } else {
-        format!("{} {}", inter_str, diff2_tokens.join(" "))
+        format!("{} {}", inter_str, sorted_diff2.join(" "))
     };
     
-    let r1 = partial_ratio_internal(&inter_str, &combined1);
-    let r2 = partial_ratio_internal(&inter_str, &combined2);
-    let r3 = partial_ratio_internal(&combined1, &combined2);
-    
-    let result = r1.max(r2).max(r3);
+    let result = if inter_str.is_empty() {
+        partial_ratio_internal(&combined1, &combined2)
+    } else {
+        let r1 = partial_ratio_internal(&inter_str, &combined1);
+        let r2 = partial_ratio_internal(&inter_str, &combined2);
+        let r3 = partial_ratio_internal(&combined1, &combined2);
+        r1.max(r2).max(r3)
+    };
     
     match score_cutoff {
         Some(cutoff) if result < cutoff => 0.0,

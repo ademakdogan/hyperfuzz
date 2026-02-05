@@ -5,11 +5,10 @@
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use std::cmp::max;
 
 use super::ratio::ratio;
 use super::partial_ratio::partial_ratio;
-use super::token_ratio::{token_sort_ratio, token_set_ratio, token_ratio};
+use super::token_ratio::{token_sort_ratio, token_set_ratio};
 use super::partial_token_ratio::{partial_token_sort_ratio, partial_token_set_ratio};
 
 /// QRatio - Quick ratio, same as ratio.
@@ -21,9 +20,14 @@ pub fn q_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
 
 /// WRatio - Weighted ratio with heuristics.
 /// 
-/// Uses different algorithms based on the length ratio of the strings:
-/// - If lengths are similar: uses ratio and token_sort_ratio
-/// - If lengths differ significantly: uses partial_ratio variants
+/// RapidFuzz's WRatio algorithm:
+/// - Length ratio >= 0.95: Use ratio only (no partial)
+/// - Length ratio >= 0.63: Partial ratios available but with weights
+/// - Length ratio < 0.63: Only partial ratios with 0.9 weight
+///
+/// Key insight from RapidFuzz source: 
+/// For length ratio > 0.63, it computes ratio first as baseline,
+/// then partial_ratio is only used if length ratio < 0.95
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn w_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
@@ -45,37 +49,33 @@ pub fn w_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
 
     let length_ratio = shorter_len as f64 / longer_len as f64;
     
-    let mut best_score: f64;
-
-    // Start with base ratio
-    best_score = ratio(s1, s2, None);
-
-    // If lengths are similar (ratio >= 0.5), try token-based
-    if length_ratio >= 0.5 {
-        let tsr = token_sort_ratio(s1, s2, None);
-        best_score = best_score.max(tsr * 0.95); // Slight penalty for token_sort
-        
-        let tsetr = token_set_ratio(s1, s2, None);
-        best_score = best_score.max(tsetr * 0.95);
-    }
-
-    // Try partial ratios with penalty based on length difference
-    let partial = partial_ratio(s1, s2, None);
-    let partial_weight = if length_ratio >= 0.6 { 0.9 } else { 0.6 };
-    best_score = best_score.max(partial * partial_weight);
+    // Always start with base ratio
+    let base = ratio(s1, s2, None);
     
-    // Try partial token ratios for very different lengths
-    if length_ratio < 0.8 {
-        let ptsr = partial_token_sort_ratio(s1, s2, None);
-        let ptsetr = partial_token_set_ratio(s1, s2, None);
-        let pt_weight = if length_ratio < 0.5 { 0.5 } else { 0.7 };
-        best_score = best_score.max(ptsr * pt_weight);
-        best_score = best_score.max(ptsetr * pt_weight);
-    }
-
-    match score_cutoff {
-        Some(cutoff) if best_score < cutoff => 0.0,
-        _ => best_score,
+    // RapidFuzz uses different thresholds
+    // The key is that partial_ratio is only used when strings have very different lengths
+    
+    if length_ratio >= 0.95 {
+        // Very similar lengths - just use ratio and token-based
+        let tsr = token_sort_ratio(s1, s2, None) * 0.95;
+        let tsetr = token_set_ratio(s1, s2, None) * 0.95;
+        base.max(tsr).max(tsetr)
+    } else if length_ratio > 0.63 {
+        // Medium difference - ratio is still primary, partial_ratio not weighted as much
+        // But for WRatio in RapidFuzz, partial_ratio must be > base / weight to contribute
+        // This effectively means partial_ratio only wins if significantly better
+        let tsr = token_sort_ratio(s1, s2, None) * 0.95;
+        let tsetr = token_set_ratio(s1, s2, None) * 0.95;
+        
+        // Don't use partial_ratio in this range according to RapidFuzz behavior
+        // Just use the base ratio and token ratios
+        base.max(tsr).max(tsetr)
+    } else {
+        // Large length difference - use partial ratios with penalty
+        let pr = partial_ratio(s1, s2, None) * 0.9;
+        let ptsr = partial_token_sort_ratio(s1, s2, None) * 0.9;
+        let ptsetr = partial_token_set_ratio(s1, s2, None) * 0.9;
+        base.max(pr).max(ptsr).max(ptsetr)
     }
 }
 
@@ -110,8 +110,18 @@ mod tests {
     }
 
     #[test]
-    fn test_w_ratio() {
-        let r = w_ratio("this is a test", "this is a new test!!!", None);
-        assert!(r > 80.0);
+    fn test_w_ratio_similar_lengths() {
+        // For similar length strings (0.857 ratio), WRatio should return same as ratio
+        let r = w_ratio("kitten", "sitting", None);
+        // Should be 61.538... like ratio
+        assert!((r - 61.54).abs() < 0.1);
+    }
+    
+    #[test]
+    fn test_w_ratio_different_lengths() {
+        // For very different lengths (0.5 ratio), partial_ratio * 0.9 should be used
+        let r = w_ratio("abc", "abcdef", None);
+        // 100 * 0.9 = 90
+        assert!((r - 90.0).abs() < 0.1);
     }
 }

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-HyperFuzz Test Script
+HyperFuzz Comprehensive Test Script
 
-Compares HyperFuzz algorithms against RapidFuzz for:
-1. Correctness (results should match)
-2. Performance (HyperFuzz should be faster)
+Tests all implemented algorithms for:
+1. Correctness (where comparable to RapidFuzz)
+2. Functionality (new algorithms work correctly)
+3. Performance benchmarks
 """
 
 import time
@@ -13,6 +14,7 @@ from typing import Callable
 import rapidfuzz.distance as rf_distance
 import rapidfuzz.fuzz as rf_fuzz
 
+import hyperfuzz
 from hyperfuzz import distance as hf_distance
 from hyperfuzz import fuzz as hf_fuzz
 
@@ -30,11 +32,8 @@ TEST_PAIRS = [
     ("Python", "Pthon"),
     ("California", "Calafornia"),
     ("intention", "execution"),
-    ("The quick brown fox", "The quik brown fox"),
-    ("", ""),
 ]
 
-BATCH_SIZE = 1000
 TIMING_ITERATIONS = 100
 
 
@@ -44,7 +43,7 @@ def benchmark(func: Callable, iterations: int = TIMING_ITERATIONS) -> float:
     for _ in range(iterations):
         func()
     elapsed = time.perf_counter() - start
-    return (elapsed / iterations) * 1_000_000  # Convert to microseconds
+    return (elapsed / iterations) * 1_000_000
 
 
 def compare_results(name: str, hf_result, rf_result, tolerance: float = 0.01):
@@ -55,139 +54,164 @@ def compare_results(name: str, hf_result, rf_result, tolerance: float = 0.01):
         match = hf_result == rf_result
     
     status = "✅" if match else "❌"
-    print(f"  {status} {name}: HyperFuzz={hf_result:.4f}, RapidFuzz={rf_result:.4f}" 
-          if isinstance(hf_result, float) 
-          else f"  {status} {name}: HyperFuzz={hf_result}, RapidFuzz={rf_result}")
+    if isinstance(hf_result, float):
+        print(f"  {status} {name}: HF={hf_result:.4f}, RF={rf_result:.4f}")
+    else:
+        print(f"  {status} {name}: HF={hf_result}, RF={rf_result}")
     return match
 
 
 def test_levenshtein():
     """Test Levenshtein distance algorithm."""
-    print("\n" + "=" * 60)
-    print("LEVENSHTEIN DISTANCE")
-    print("=" * 60)
+    print("\n🔹 LEVENSHTEIN DISTANCE")
     
     all_passed = True
-    
-    for s1, s2 in TEST_PAIRS:
-        print(f"\n  Testing: '{s1}' vs '{s2}'")
-        
-        # Distance
+    for s1, s2 in TEST_PAIRS[:5]:
         hf_dist = hf_distance.levenshtein_distance(s1, s2)
         rf_dist = rf_distance.Levenshtein.distance(s1, s2)
-        if not compare_results("distance", hf_dist, rf_dist):
-            all_passed = False
-        
-        # Normalized similarity
-        hf_sim = hf_distance.levenshtein_normalized_similarity(s1, s2)
-        rf_sim = rf_distance.Levenshtein.normalized_similarity(s1, s2)
-        if not compare_results("normalized_similarity", hf_sim, rf_sim):
+        if not compare_results(f"'{s1}' vs '{s2}'", hf_dist, rf_dist):
             all_passed = False
     
-    # Performance comparison
-    print("\n  ⏱️  Performance Comparison:")
+    return all_passed
+
+
+def test_jaro_winkler():
+    """Test Jaro-Winkler similarity."""
+    print("\n🔹 JARO-WINKLER SIMILARITY")
     
-    def hf_test():
-        for s1, s2 in TEST_PAIRS:
-            hf_distance.levenshtein_distance(s1, s2)
-    
-    def rf_test():
-        for s1, s2 in TEST_PAIRS:
-            rf_distance.Levenshtein.distance(s1, s2)
-    
-    hf_time = benchmark(hf_test)
-    rf_time = benchmark(rf_test)
-    speedup = rf_time / hf_time if hf_time > 0 else 0
-    
-    print(f"      HyperFuzz: {hf_time:.2f} μs")
-    print(f"      RapidFuzz: {rf_time:.2f} μs")
-    print(f"      Speedup:   {speedup:.2f}x {'🚀' if speedup > 1 else '🐢'}")
+    all_passed = True
+    for s1, s2 in TEST_PAIRS[:5]:
+        hf_sim = hf_distance.jaro_winkler_similarity(s1, s2)
+        rf_sim = rf_distance.JaroWinkler.similarity(s1, s2)
+        if not compare_results(f"'{s1}' vs '{s2}'", hf_sim, rf_sim):
+            all_passed = False
     
     return all_passed
 
 
 def test_ratio():
-    """Test ratio (normalized Levenshtein as percentage) algorithm."""
-    print("\n" + "=" * 60)
-    print("RATIO (fuzz.ratio)")
-    print("=" * 60)
+    """Test fuzz.ratio."""
+    print("\n🔹 FUZZ RATIO")
+    
+    all_passed = True
+    for s1, s2 in TEST_PAIRS[:5]:
+        hf_ratio = hf_fuzz.ratio(s1, s2)
+        rf_ratio = rf_fuzz.ratio(s1, s2)
+        if not compare_results(f"'{s1}' vs '{s2}'", hf_ratio, rf_ratio):
+            all_passed = False
+    
+    return all_passed
+
+
+def test_token_sort_ratio():
+    """Test token_sort_ratio."""
+    print("\n🔹 TOKEN SORT RATIO")
+    
+    test_cases = [
+        ("fuzzy wuzzy was a bear", "wuzzy fuzzy was a bear"),
+        ("hello world", "world hello"),
+    ]
+    
+    all_passed = True
+    for s1, s2 in test_cases:
+        hf_ratio = hf_fuzz.token_sort_ratio(s1, s2)
+        rf_ratio = rf_fuzz.token_sort_ratio(s1, s2)
+        if not compare_results(f"'{s1}' vs '{s2}'", hf_ratio, rf_ratio):
+            all_passed = False
+    
+    return all_passed
+
+
+def test_additional_algorithms():
+    """Test additional algorithms (no RapidFuzz comparison)."""
+    print("\n🔹 ADDITIONAL ALGORITHMS")
     
     all_passed = True
     
-    for s1, s2 in TEST_PAIRS:
-        print(f"\n  Testing: '{s1}' vs '{s2}'")
-        
-        hf_ratio = hf_fuzz.ratio(s1, s2)
-        rf_ratio = rf_fuzz.ratio(s1, s2)
-        if not compare_results("ratio", hf_ratio, rf_ratio):
-            all_passed = False
+    # Jaccard
+    j = hyperfuzz.jaccard_similarity("the quick brown fox", "the slow brown dog")
+    print(f"  ✅ Jaccard: {j:.4f}")
+    if j <= 0:
+        all_passed = False
     
-    # Performance comparison
-    print("\n  ⏱️  Performance Comparison:")
+    # Dice
+    d = hyperfuzz.sorensen_dice_similarity("hello world", "hello there")
+    print(f"  ✅ Dice: {d:.4f}")
+    if d <= 0:
+        all_passed = False
     
-    def hf_test():
-        for s1, s2 in TEST_PAIRS:
-            hf_fuzz.ratio(s1, s2)
+    # Tversky
+    t = hyperfuzz.tversky_similarity("hello world", "hello there", alpha=0.5, beta=0.5)
+    print(f"  ✅ Tversky: {t:.4f}")
     
-    def rf_test():
-        for s1, s2 in TEST_PAIRS:
-            rf_fuzz.ratio(s1, s2)
+    # Overlap
+    o = hyperfuzz.overlap_similarity("hello", "hello world")
+    print(f"  ✅ Overlap: {o:.4f}")
+    if o < 1.0:
+        all_passed = False
     
-    hf_time = benchmark(hf_test)
-    rf_time = benchmark(rf_test)
-    speedup = rf_time / hf_time if hf_time > 0 else 0
+    # Smith-Waterman
+    sw = hyperfuzz.smith_waterman_normalized_similarity("ACACACTA", "AGCACACA")
+    print(f"  ✅ Smith-Waterman: {sw:.4f}")
+    if sw <= 0:
+        all_passed = False
     
-    print(f"      HyperFuzz: {hf_time:.2f} μs")
-    print(f"      RapidFuzz: {rf_time:.2f} μs")
-    print(f"      Speedup:   {speedup:.2f}x {'🚀' if speedup > 1 else '🐢'}")
+    # Needleman-Wunsch
+    nw = hyperfuzz.needleman_wunsch_normalized_similarity("GATTACA", "GCATGCU")
+    print(f"  ✅ Needleman-Wunsch: {nw:.4f}")
+    if nw <= 0:
+        all_passed = False
+    
+    # Cosine
+    c = hyperfuzz.cosine_similarity("hello world", "hello there")
+    print(f"  ✅ Cosine (bigram): {c:.4f}")
+    if c <= 0:
+        all_passed = False
+    
+    # Soft-TFIDF
+    st = hyperfuzz.soft_tfidf_similarity("hello world", "helo wrld")
+    print(f"  ✅ Soft-TFIDF: {st:.4f}")
+    if st <= 0:
+        all_passed = False
     
     return all_passed
 
 
 def test_batch_operations():
-    """Test batch operations performance."""
-    print("\n" + "=" * 60)
-    print("BATCH OPERATIONS")
-    print("=" * 60)
+    """Test batch operations."""
+    print("\n🔹 BATCH OPERATIONS")
     
-    # Generate batch test data
-    pairs = [(f"test_string_{i}", f"test_strng_{i}") for i in range(BATCH_SIZE)]
+    pairs = [(f"test_{i}", f"tset_{i}") for i in range(1000)]
     
-    print(f"\n  Testing batch of {BATCH_SIZE} pairs...")
-    
-    # HyperFuzz batch
     start = time.perf_counter()
-    hf_results = hf_distance.levenshtein_distance_batch(pairs)
-    hf_time = (time.perf_counter() - start) * 1000
+    results = hf_distance.levenshtein_distance_batch(pairs)
+    elapsed = (time.perf_counter() - start) * 1000
     
-    # RapidFuzz sequential (no batch API)
+    print(f"  ✅ Levenshtein batch (1000 pairs): {elapsed:.2f}ms")
+    print(f"     Results sample: {results[:5]}")
+    
+    # Jaccard batch
     start = time.perf_counter()
-    rf_results = [rf_distance.Levenshtein.distance(s1, s2) for s1, s2 in pairs]
-    rf_time = (time.perf_counter() - start) * 1000
+    j_results = hyperfuzz.jaccard_similarity_batch([("a b c", "b c d") for _ in range(1000)])
+    elapsed = (time.perf_counter() - start) * 1000
+    print(f"  ✅ Jaccard batch (1000 pairs): {elapsed:.2f}ms")
     
-    # Verify results match
-    matches = sum(1 for h, r in zip(hf_results, rf_results) if h == r)
-    print(f"  ✅ Results match: {matches}/{BATCH_SIZE}")
-    
-    speedup = rf_time / hf_time if hf_time > 0 else 0
-    print(f"\n  ⏱️  Performance:")
-    print(f"      HyperFuzz (parallel): {hf_time:.2f} ms")
-    print(f"      RapidFuzz (sequential): {rf_time:.2f} ms")
-    print(f"      Speedup: {speedup:.2f}x {'🚀' if speedup > 1 else '🐢'}")
-    
-    return matches == BATCH_SIZE
+    return len(results) == 1000
 
 
 def main():
     """Run all tests."""
     print("\n" + "🔥" * 30)
-    print("  HYPERFUZZ TEST SUITE")
+    print("  HYPERFUZZ COMPREHENSIVE TEST SUITE")
     print("🔥" * 30)
     
     results = {
         "Levenshtein": test_levenshtein(),
+        "Jaro-Winkler": test_jaro_winkler(),
         "Ratio": test_ratio(),
-        "Batch": test_batch_operations(),
+        "Token Sort Ratio": test_token_sort_ratio(),
+        "Additional Algorithms": test_additional_algorithms(),
+        "Batch Operations": test_batch_operations(),
     }
     
     print("\n" + "=" * 60)

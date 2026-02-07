@@ -1,21 +1,22 @@
-//! Jaro similarity algorithm
+//! Jaro similarity algorithm - Optimized
 //!
 //! Measures similarity between two strings based on matching characters
 //! and transpositions.
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 use std::cmp::{max, min};
 
-/// Calculate Jaro similarity between two strings.
-/// Returns a value between 0.0 and 1.0.
-#[inline(always)]
-fn jaro_similarity_internal(s1: &str, s2: &str) -> f64 {
-    let s1_chars: Vec<char> = s1.chars().collect();
-    let s2_chars: Vec<char> = s2.chars().collect();
+// Stack allocation for typical string lengths
+type CharVec = SmallVec<[char; 64]>;
+type BoolVec = SmallVec<[bool; 64]>;
 
-    let len1 = s1_chars.len();
-    let len2 = s2_chars.len();
+/// Calculate Jaro similarity for ASCII strings (byte-level)
+#[inline(always)]
+fn jaro_similarity_ascii(s1: &[u8], s2: &[u8]) -> f64 {
+    let len1 = s1.len();
+    let len2 = s2.len();
 
     if len1 == 0 && len2 == 0 {
         return 1.0;
@@ -24,27 +25,22 @@ fn jaro_similarity_internal(s1: &str, s2: &str) -> f64 {
         return 0.0;
     }
 
-    // Fast path for identical strings
-    if s1 == s2 {
-        return 1.0;
-    }
-
     // Match window size
     let match_distance = max(len1, len2) / 2;
     let match_distance = if match_distance > 0 { match_distance - 1 } else { 0 };
 
-    let mut s1_matches = vec![false; len1];
-    let mut s2_matches = vec![false; len2];
+    let mut s1_matches: BoolVec = SmallVec::from_elem(false, len1);
+    let mut s2_matches: BoolVec = SmallVec::from_elem(false, len2);
     let mut matches = 0usize;
     let mut transpositions = 0usize;
 
     // Find matching characters
     for i in 0..len1 {
-        let start = if i > match_distance { i - match_distance } else { 0 };
+        let start = i.saturating_sub(match_distance);
         let end = min(i + match_distance + 1, len2);
 
         for j in start..end {
-            if s2_matches[j] || s1_chars[i] != s2_chars[j] {
+            if s2_matches[j] || s1[i] != s2[j] {
                 continue;
             }
             s1_matches[i] = true;
@@ -67,6 +63,66 @@ fn jaro_similarity_internal(s1: &str, s2: &str) -> f64 {
         while !s2_matches[k] {
             k += 1;
         }
+        if s1[i] != s2[k] {
+            transpositions += 1;
+        }
+        k += 1;
+    }
+
+    let m = matches as f64;
+    let t = (transpositions / 2) as f64;
+
+    (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
+}
+
+/// Calculate Jaro similarity for Unicode strings
+#[inline(always)]
+fn jaro_similarity_chars(s1_chars: &[char], s2_chars: &[char]) -> f64 {
+    let len1 = s1_chars.len();
+    let len2 = s2_chars.len();
+
+    if len1 == 0 && len2 == 0 {
+        return 1.0;
+    }
+    if len1 == 0 || len2 == 0 {
+        return 0.0;
+    }
+
+    let match_distance = max(len1, len2) / 2;
+    let match_distance = if match_distance > 0 { match_distance - 1 } else { 0 };
+
+    let mut s1_matches: BoolVec = SmallVec::from_elem(false, len1);
+    let mut s2_matches: BoolVec = SmallVec::from_elem(false, len2);
+    let mut matches = 0usize;
+    let mut transpositions = 0usize;
+
+    for i in 0..len1 {
+        let start = i.saturating_sub(match_distance);
+        let end = min(i + match_distance + 1, len2);
+
+        for j in start..end {
+            if s2_matches[j] || s1_chars[i] != s2_chars[j] {
+                continue;
+            }
+            s1_matches[i] = true;
+            s2_matches[j] = true;
+            matches += 1;
+            break;
+        }
+    }
+
+    if matches == 0 {
+        return 0.0;
+    }
+
+    let mut k = 0;
+    for i in 0..len1 {
+        if !s1_matches[i] {
+            continue;
+        }
+        while !s2_matches[k] {
+            k += 1;
+        }
         if s1_chars[i] != s2_chars[k] {
             transpositions += 1;
         }
@@ -77,6 +133,25 @@ fn jaro_similarity_internal(s1: &str, s2: &str) -> f64 {
     let t = (transpositions / 2) as f64;
 
     (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
+}
+
+/// Calculate Jaro similarity between two strings.
+#[inline(always)]
+fn jaro_similarity_internal(s1: &str, s2: &str) -> f64 {
+    // Fast path for identical strings
+    if s1 == s2 {
+        return if s1.is_empty() && s2.is_empty() { 1.0 } else if s1.is_empty() { 0.0 } else { 1.0 };
+    }
+
+    // ASCII fast path
+    if s1.is_ascii() && s2.is_ascii() {
+        return jaro_similarity_ascii(s1.as_bytes(), s2.as_bytes());
+    }
+
+    // Unicode path
+    let s1_chars: CharVec = s1.chars().collect();
+    let s2_chars: CharVec = s2.chars().collect();
+    jaro_similarity_chars(&s1_chars, &s2_chars)
 }
 
 /// Calculate Jaro similarity between two strings.

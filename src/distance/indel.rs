@@ -1,41 +1,101 @@
-//! Indel distance algorithm (insertion/deletion only)
+//! Indel distance algorithm (insertion/deletion only) - Optimized
 //!
 //! Based on Longest Common Subsequence. Only insertions and deletions,
 //! no substitutions allowed.
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 use std::cmp::max;
 
-/// Calculate LCS length between two strings.
-#[inline(always)]
-fn lcs_length(s1: &str, s2: &str) -> usize {
-    let s1_chars: Vec<char> = s1.chars().collect();
-    let s2_chars: Vec<char> = s2.chars().collect();
+type CharVec = SmallVec<[char; 64]>;
+type RowVec = SmallVec<[usize; 64]>;
 
-    let m = s1_chars.len();
-    let n = s2_chars.len();
+/// Calculate LCS length for ASCII strings
+#[inline(always)]
+fn lcs_length_ascii(s1: &[u8], s2: &[u8]) -> usize {
+    let m = s1.len();
+    let n = s2.len();
 
     if m == 0 || n == 0 {
         return 0;
     }
 
-    let mut prev: Vec<usize> = vec![0; n + 1];
-    let mut curr: Vec<usize> = vec![0; n + 1];
+    // Make s1 the shorter string
+    let (s1, s2, m, n) = if m > n {
+        (s2, s1, n, m)
+    } else {
+        (s1, s2, m, n)
+    };
 
-    for i in 1..=m {
-        for j in 1..=n {
-            if s1_chars[i - 1] == s2_chars[j - 1] {
-                curr[j] = prev[j - 1] + 1;
+    let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
+    let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
+
+    for j in 1..=n {
+        for i in 1..=m {
+            curr[i] = if s1[i - 1] == s2[j - 1] {
+                prev[i - 1] + 1
             } else {
-                curr[j] = max(prev[j], curr[j - 1]);
-            }
+                max(prev[i], curr[i - 1])
+            };
         }
         std::mem::swap(&mut prev, &mut curr);
         curr.fill(0);
     }
 
-    prev[n]
+    prev[m]
+}
+
+/// Calculate LCS length for Unicode chars
+#[inline(always)]
+fn lcs_length_chars(s1: &[char], s2: &[char]) -> usize {
+    let m = s1.len();
+    let n = s2.len();
+
+    if m == 0 || n == 0 {
+        return 0;
+    }
+
+    let (s1, s2, m, n) = if m > n {
+        (s2, s1, n, m)
+    } else {
+        (s1, s2, m, n)
+    };
+
+    let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
+    let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
+
+    for j in 1..=n {
+        for i in 1..=m {
+            curr[i] = if s1[i - 1] == s2[j - 1] {
+                prev[i - 1] + 1
+            } else {
+                max(prev[i], curr[i - 1])
+            };
+        }
+        std::mem::swap(&mut prev, &mut curr);
+        curr.fill(0);
+    }
+
+    prev[m]
+}
+
+/// Calculate LCS length between two strings.
+#[inline(always)]
+fn lcs_length(s1: &str, s2: &str) -> usize {
+    if s1.is_ascii() && s2.is_ascii() {
+        return lcs_length_ascii(s1.as_bytes(), s2.as_bytes());
+    }
+    
+    let s1_chars: CharVec = s1.chars().collect();
+    let s2_chars: CharVec = s2.chars().collect();
+    lcs_length_chars(&s1_chars, &s2_chars)
+}
+
+/// Get string length (fast for ASCII)
+#[inline(always)]
+fn str_len(s: &str) -> usize {
+    if s.is_ascii() { s.len() } else { s.chars().count() }
 }
 
 /// Calculate the Indel distance (insertions + deletions needed).
@@ -43,8 +103,12 @@ fn lcs_length(s1: &str, s2: &str) -> usize {
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn indel_distance(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usize {
-    let len1 = s1.chars().count();
-    let len2 = s2.chars().count();
+    if s1 == s2 {
+        return 0;
+    }
+    
+    let len1 = str_len(s1);
+    let len2 = str_len(s2);
     let lcs = lcs_length(s1, s2);
     let dist = len1 + len2 - 2 * lcs;
 
@@ -59,6 +123,10 @@ pub fn indel_distance(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usize 
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn indel_similarity(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usize {
+    if s1 == s2 {
+        return str_len(s1) * 2;
+    }
+    
     let lcs = lcs_length(s1, s2);
     let sim = 2 * lcs;
 
@@ -72,8 +140,12 @@ pub fn indel_similarity(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usiz
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn indel_normalized_distance(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
-    let len1 = s1.chars().count();
-    let len2 = s2.chars().count();
+    if s1 == s2 {
+        return 0.0;
+    }
+    
+    let len1 = str_len(s1);
+    let len2 = str_len(s2);
     let total = len1 + len2;
 
     if total == 0 {
@@ -142,7 +214,6 @@ mod tests {
 
     #[test]
     fn test_indel_distance() {
-        // "abc" to "ace": delete 'b', insert 'e' = 2 ops
         assert_eq!(indel_distance("abcde", "ace", None), 2);
     }
 }

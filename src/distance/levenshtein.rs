@@ -1,62 +1,156 @@
-//! Levenshtein distance algorithm
+//! Levenshtein distance algorithm - Optimized
 //!
 //! Calculates the minimum number of single-character edits (insertions, deletions,
 //! or substitutions) required to change one string into the other.
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use std::cmp::min;
+use smallvec::SmallVec;
+
+// Stack-allocate arrays up to 64 elements to avoid heap allocation for short strings
+type CharVec = SmallVec<[char; 64]>;
+type RowVec = SmallVec<[usize; 64]>;
 
 /// Calculate the Levenshtein distance between two strings.
 ///
-/// Uses Wagner-Fischer algorithm with O(min(m,n)) space complexity.
+/// Optimized Wagner-Fischer algorithm with:
+/// - SmallVec for stack allocation of small strings
+/// - Early termination checks
+/// - Reduced branching in hot loop
+/// - Common prefix/suffix elimination
 #[inline(always)]
 fn levenshtein_distance_internal(s1: &str, s2: &str) -> usize {
-    let s1_chars: Vec<char> = s1.chars().collect();
-    let s2_chars: Vec<char> = s2.chars().collect();
-
-    let m = s1_chars.len();
-    let n = s2_chars.len();
-
-    // Early exits
-    if m == 0 {
-        return n;
-    }
-    if n == 0 {
-        return m;
-    }
+    // Fast path for identical strings
     if s1 == s2 {
         return 0;
     }
+    
+    let s1_bytes = s1.as_bytes();
+    let s2_bytes = s2.as_bytes();
+    
+    // For ASCII strings, work with bytes directly (much faster)
+    if s1.is_ascii() && s2.is_ascii() {
+        return levenshtein_ascii(s1_bytes, s2_bytes);
+    }
+    
+    // Unicode path
+    let s1_chars: CharVec = s1.chars().collect();
+    let s2_chars: CharVec = s2.chars().collect();
 
-    // Ensure s1 is the shorter string for space optimization
-    let (s1_chars, s2_chars, m, n) = if m > n {
-        (s2_chars, s1_chars, n, m)
+    levenshtein_chars(&s1_chars, &s2_chars)
+}
+
+/// Levenshtein for ASCII strings (byte-level, faster)
+#[inline(always)]
+fn levenshtein_ascii(s1: &[u8], s2: &[u8]) -> usize {
+    let mut m = s1.len();
+    let mut n = s2.len();
+
+    // Early exits
+    if m == 0 { return n; }
+    if n == 0 { return m; }
+
+    // Make s1 the shorter string
+    let (s1, s2) = if m > n {
+        std::mem::swap(&mut m, &mut n);
+        (s2, s1)
     } else {
-        (s1_chars, s2_chars, m, n)
+        (s1, s2)
     };
 
-    // Use two rows instead of full matrix
-    let mut prev_row: Vec<usize> = (0..=m).collect();
-    let mut curr_row: Vec<usize> = vec![0; m + 1];
+    // Skip common prefix
+    let prefix_len = s1.iter().zip(s2.iter()).take_while(|(a, b)| a == b).count();
+    if prefix_len == m {
+        return n - m;
+    }
+    
+    let s1 = &s1[prefix_len..];
+    let s2 = &s2[prefix_len..];
+    let m = s1.len();
+    let n = s2.len();
 
-    for j in 1..=n {
-        curr_row[0] = j;
+    // Skip common suffix
+    let suffix_len = s1.iter().rev().zip(s2.iter().rev()).take_while(|(a, b)| a == b).count();
+    let s1 = &s1[..m - suffix_len];
+    let s2 = &s2[..n - suffix_len];
+    let m = s1.len();
+    let n = s2.len();
 
-        for i in 1..=m {
-            let cost = if s1_chars[i - 1] == s2_chars[j - 1] {
-                0
-            } else {
-                1
-            };
+    if m == 0 { return n; }
+    if n == 0 { return m; }
 
-            curr_row[i] = min(
-                min(
-                    prev_row[i] + 1,     // deletion
-                    curr_row[i - 1] + 1, // insertion
-                ),
-                prev_row[i - 1] + cost, // substitution
-            );
+    // Use SmallVec for stack allocation
+    let mut prev_row: RowVec = (0..=m).collect();
+    let mut curr_row: RowVec = SmallVec::from_elem(0, m + 1);
+
+    for (j, c2) in s2.iter().enumerate() {
+        curr_row[0] = j + 1;
+
+        for (i, c1) in s1.iter().enumerate() {
+            let sub_cost = prev_row[i] + (*c1 != *c2) as usize;
+            let del_cost = prev_row[i + 1] + 1;
+            let ins_cost = curr_row[i] + 1;
+
+            curr_row[i + 1] = sub_cost.min(del_cost).min(ins_cost);
+        }
+
+        std::mem::swap(&mut prev_row, &mut curr_row);
+    }
+
+    prev_row[m]
+}
+
+/// Levenshtein for Unicode chars
+#[inline(always)]
+fn levenshtein_chars(s1: &[char], s2: &[char]) -> usize {
+    let mut m = s1.len();
+    let mut n = s2.len();
+
+    // Early exits
+    if m == 0 { return n; }
+    if n == 0 { return m; }
+
+    // Make s1 the shorter string
+    let (s1, s2) = if m > n {
+        std::mem::swap(&mut m, &mut n);
+        (s2, s1)
+    } else {
+        (s1, s2)
+    };
+
+    // Skip common prefix
+    let prefix_len = s1.iter().zip(s2.iter()).take_while(|(a, b)| a == b).count();
+    if prefix_len == m {
+        return n - m;
+    }
+    
+    let s1 = &s1[prefix_len..];
+    let s2 = &s2[prefix_len..];
+    let m = s1.len();
+    let n = s2.len();
+
+    // Skip common suffix
+    let suffix_len = s1.iter().rev().zip(s2.iter().rev()).take_while(|(a, b)| a == b).count();
+    let s1 = &s1[..m - suffix_len];
+    let s2 = &s2[..n - suffix_len];
+    let m = s1.len();
+    let n = s2.len();
+
+    if m == 0 { return n; }
+    if n == 0 { return m; }
+
+    let mut prev_row: RowVec = (0..=m).collect();
+    let mut curr_row: RowVec = SmallVec::from_elem(0, m + 1);
+
+    for (j, c2) in s2.iter().enumerate() {
+        curr_row[0] = j + 1;
+
+        for (i, c1) in s1.iter().enumerate() {
+            let sub_cost = prev_row[i] + (*c1 != *c2) as usize;
+            let del_cost = prev_row[i + 1] + 1;
+            let ins_cost = curr_row[i] + 1;
+
+            curr_row[i + 1] = sub_cost.min(del_cost).min(ins_cost);
         }
 
         std::mem::swap(&mut prev_row, &mut curr_row);
@@ -81,7 +175,9 @@ pub fn levenshtein_distance(s1: &str, s2: &str, score_cutoff: Option<usize>) -> 
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn levenshtein_similarity(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usize {
-    let max_len = s1.chars().count().max(s2.chars().count());
+    let len1 = if s1.is_ascii() { s1.len() } else { s1.chars().count() };
+    let len2 = if s2.is_ascii() { s2.len() } else { s2.chars().count() };
+    let max_len = len1.max(len2);
     let dist = levenshtein_distance_internal(s1, s2);
     let sim = max_len.saturating_sub(dist);
 
@@ -95,9 +191,9 @@ pub fn levenshtein_similarity(s1: &str, s2: &str, score_cutoff: Option<usize>) -
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn levenshtein_normalized_distance(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
-    let m = s1.chars().count();
-    let n = s2.chars().count();
-    let max_len = m.max(n);
+    let len1 = if s1.is_ascii() { s1.len() } else { s1.chars().count() };
+    let len2 = if s2.is_ascii() { s2.len() } else { s2.chars().count() };
+    let max_len = len1.max(len2);
 
     if max_len == 0 {
         return 0.0;
@@ -190,6 +286,16 @@ mod tests {
         assert_eq!(levenshtein_distance_internal("abc", ""), 3);
         assert_eq!(levenshtein_distance_internal("abc", "abc"), 0);
         assert_eq!(levenshtein_distance_internal("abc", "abd"), 1);
+    }
+
+    #[test]
+    fn test_ascii_optimization() {
+        // ASCII path
+        assert_eq!(levenshtein_distance_internal("hello", "hallo"), 1);
+        // With common prefix
+        assert_eq!(levenshtein_distance_internal("prefix_abc", "prefix_abd"), 1);
+        // With common suffix
+        assert_eq!(levenshtein_distance_internal("abc_suffix", "abd_suffix"), 1);
     }
 
     #[test]

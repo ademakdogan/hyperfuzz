@@ -1,42 +1,99 @@
-//! Ratio algorithm - normalized Indel similarity percentage
+//! Ratio algorithm - normalized Indel similarity percentage (Optimized)
 //!
 //! This is equivalent to RapidFuzz's fuzz.ratio function.
 //! Uses LCS-based similarity: 2 * matches / (len1 + len2)
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 use std::cmp::max;
 
-/// Calculate the Longest Common Subsequence length between two strings.
-#[inline(always)]
-fn lcs_length(s1: &str, s2: &str) -> usize {
-    let s1_chars: Vec<char> = s1.chars().collect();
-    let s2_chars: Vec<char> = s2.chars().collect();
+// Stack allocation for small strings
+type CharVec = SmallVec<[char; 64]>;
+type RowVec = SmallVec<[usize; 64]>;
 
-    let m = s1_chars.len();
-    let n = s2_chars.len();
+/// Calculate the Longest Common Subsequence length for ASCII bytes
+#[inline(always)]
+fn lcs_length_ascii(s1: &[u8], s2: &[u8]) -> usize {
+    let m = s1.len();
+    let n = s2.len();
 
     if m == 0 || n == 0 {
         return 0;
     }
 
-    // Use two rows for space optimization
-    let mut prev: Vec<usize> = vec![0; n + 1];
-    let mut curr: Vec<usize> = vec![0; n + 1];
+    // Ensure s1 is shorter for space efficiency
+    let (s1, s2, m, n) = if m > n {
+        (s2, s1, n, m)
+    } else {
+        (s1, s2, m, n)
+    };
 
-    for i in 1..=m {
-        for j in 1..=n {
-            if s1_chars[i - 1] == s2_chars[j - 1] {
-                curr[j] = prev[j - 1] + 1;
+    let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
+    let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
+
+    for j in 1..=n {
+        for i in 1..=m {
+            if s1[i - 1] == s2[j - 1] {
+                curr[i] = prev[i - 1] + 1;
             } else {
-                curr[j] = max(prev[j], curr[j - 1]);
+                curr[i] = max(prev[i], curr[i - 1]);
             }
         }
         std::mem::swap(&mut prev, &mut curr);
         curr.fill(0);
     }
 
-    prev[n]
+    prev[m]
+}
+
+/// Calculate the Longest Common Subsequence length for Unicode chars
+#[inline(always)]
+fn lcs_length_chars(s1: &[char], s2: &[char]) -> usize {
+    let m = s1.len();
+    let n = s2.len();
+
+    if m == 0 || n == 0 {
+        return 0;
+    }
+
+    // Ensure s1 is shorter
+    let (s1, s2, m, n) = if m > n {
+        (s2, s1, n, m)
+    } else {
+        (s1, s2, m, n)
+    };
+
+    let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
+    let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
+
+    for j in 1..=n {
+        for i in 1..=m {
+            if s1[i - 1] == s2[j - 1] {
+                curr[i] = prev[i - 1] + 1;
+            } else {
+                curr[i] = max(prev[i], curr[i - 1]);
+            }
+        }
+        std::mem::swap(&mut prev, &mut curr);
+        curr.fill(0);
+    }
+
+    prev[m]
+}
+
+/// Calculate the Longest Common Subsequence length between two strings.
+#[inline(always)]
+pub fn lcs_length(s1: &str, s2: &str) -> usize {
+    // Fast path for ASCII strings
+    if s1.is_ascii() && s2.is_ascii() {
+        return lcs_length_ascii(s1.as_bytes(), s2.as_bytes());
+    }
+    
+    // Unicode path
+    let s1_chars: CharVec = s1.chars().collect();
+    let s2_chars: CharVec = s2.chars().collect();
+    lcs_length_chars(&s1_chars, &s2_chars)
 }
 
 /// Calculate the ratio (normalized Indel similarity) as a percentage (0-100).
@@ -46,16 +103,20 @@ fn lcs_length(s1: &str, s2: &str) -> usize {
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
-    let len1 = s1.chars().count();
-    let len2 = s2.chars().count();
+    // Fast path for identical strings
+    if s1 == s2 {
+        return if s1.is_empty() { 100.0 } else { 100.0 };
+    }
+    
+    let (len1, len2) = if s1.is_ascii() && s2.is_ascii() {
+        (s1.len(), s2.len())
+    } else {
+        (s1.chars().count(), s2.chars().count())
+    };
+    
     let total_len = len1 + len2;
 
     if total_len == 0 {
-        return 100.0;
-    }
-
-    // Fast path for identical strings
-    if s1 == s2 {
         return 100.0;
     }
 

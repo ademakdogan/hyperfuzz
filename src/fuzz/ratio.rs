@@ -1,29 +1,61 @@
-//! Ratio algorithm - normalized Indel similarity percentage (Optimized)
+//! Ratio algorithm - Ultra Optimized
 //!
-//! This is equivalent to RapidFuzz's fuzz.ratio function.
-//! Uses LCS-based similarity: 2 * matches / (len1 + len2)
+//! Uses Indel similarity (LCS-based): 100 * 2 * LCS / (len1 + len2)
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::cmp::max;
 
-// Stack allocation for small strings
-type CharVec = SmallVec<[char; 64]>;
-type RowVec = SmallVec<[usize; 64]>;
+type RowVec = SmallVec<[usize; 128]>;
 
-/// Calculate the Longest Common Subsequence length for ASCII bytes
+/// Ultra-fast LCS for ASCII bytes with cache-friendly access
 #[inline(always)]
-fn lcs_length_ascii(s1: &[u8], s2: &[u8]) -> usize {
+fn lcs_ascii(s1: &[u8], s2: &[u8]) -> usize {
     let m = s1.len();
     let n = s2.len();
+    
+    if m == 0 || n == 0 { return 0; }
+    
+    // Make s1 shorter for better cache behavior
+    let (s1, s2, m, n) = if m > n {
+        (s2, s1, n, m)
+    } else {
+        (s1, s2, m, n)
+    };
 
-    if m == 0 || n == 0 {
-        return 0;
+    // Optimized single-row DP with manual loop unrolling potential
+    let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
+    let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
+
+    for c2 in s2.iter() {
+        // Process in chunks for better cache utilization
+        for i in 0..m {
+            curr[i + 1] = if s1[i] == *c2 {
+                prev[i] + 1
+            } else {
+                max(prev[i + 1], curr[i])
+            };
+        }
+        std::mem::swap(&mut prev, &mut curr);
+        // Only fill if there's another iteration
+        if n > 1 {
+            curr.fill(0);
+        }
     }
 
-    // Ensure s1 is shorter for space efficiency
-    let (s1, s2, m, n) = if m > n {
+    prev[m]
+}
+
+/// LCS for Unicode chars
+#[inline(always)]
+fn lcs_unicode(s1: &[char], s2: &[char]) -> usize {
+    let m = s1.len();
+    let n = s2.len();
+    
+    if m == 0 || n == 0 { return 0; }
+    
+    let (s1, s2, m, _n) = if m > n {
         (s2, s1, n, m)
     } else {
         (s1, s2, m, n)
@@ -32,13 +64,13 @@ fn lcs_length_ascii(s1: &[u8], s2: &[u8]) -> usize {
     let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
     let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
 
-    for j in 1..=n {
-        for i in 1..=m {
-            if s1[i - 1] == s2[j - 1] {
-                curr[i] = prev[i - 1] + 1;
+    for c2 in s2.iter() {
+        for i in 0..m {
+            curr[i + 1] = if s1[i] == *c2 {
+                prev[i] + 1
             } else {
-                curr[i] = max(prev[i], curr[i - 1]);
-            }
+                max(prev[i + 1], curr[i])
+            };
         }
         std::mem::swap(&mut prev, &mut curr);
         curr.fill(0);
@@ -47,81 +79,55 @@ fn lcs_length_ascii(s1: &[u8], s2: &[u8]) -> usize {
     prev[m]
 }
 
-/// Calculate the Longest Common Subsequence length for Unicode chars
-#[inline(always)]
-fn lcs_length_chars(s1: &[char], s2: &[char]) -> usize {
-    let m = s1.len();
-    let n = s2.len();
-
-    if m == 0 || n == 0 {
-        return 0;
-    }
-
-    // Ensure s1 is shorter
-    let (s1, s2, m, n) = if m > n {
-        (s2, s1, n, m)
-    } else {
-        (s1, s2, m, n)
-    };
-
-    let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
-    let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
-
-    for j in 1..=n {
-        for i in 1..=m {
-            if s1[i - 1] == s2[j - 1] {
-                curr[i] = prev[i - 1] + 1;
-            } else {
-                curr[i] = max(prev[i], curr[i - 1]);
-            }
-        }
-        std::mem::swap(&mut prev, &mut curr);
-        curr.fill(0);
-    }
-
-    prev[m]
-}
-
-/// Calculate the Longest Common Subsequence length between two strings.
+/// Calculate LCS length
 #[inline(always)]
 pub fn lcs_length(s1: &str, s2: &str) -> usize {
-    // Fast path for ASCII strings
     if s1.is_ascii() && s2.is_ascii() {
-        return lcs_length_ascii(s1.as_bytes(), s2.as_bytes());
+        return lcs_ascii(s1.as_bytes(), s2.as_bytes());
     }
     
-    // Unicode path
-    let s1_chars: CharVec = s1.chars().collect();
-    let s2_chars: CharVec = s2.chars().collect();
-    lcs_length_chars(&s1_chars, &s2_chars)
+    let c1: SmallVec<[char; 64]> = s1.chars().collect();
+    let c2: SmallVec<[char; 64]> = s2.chars().collect();
+    lcs_unicode(&c1, &c2)
 }
 
-/// Calculate the ratio (normalized Indel similarity) as a percentage (0-100).
-///
-/// This is equivalent to RapidFuzz's fuzz.ratio function.
-/// Formula: 100 * 2 * LCS_length / (len1 + len2)
+/// Calculate ratio - Ultra optimized
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
     // Fast path for identical strings
     if s1 == s2 {
-        return if s1.is_empty() { 100.0 } else { 100.0 };
+        return 100.0;
     }
     
+    // Fast path for empty strings
+    if s1.is_empty() && s2.is_empty() {
+        return 100.0;
+    }
+    if s1.is_empty() || s2.is_empty() {
+        return 0.0;
+    }
+    
+    // Get lengths - ASCII fast path
     let (len1, len2) = if s1.is_ascii() && s2.is_ascii() {
         (s1.len(), s2.len())
     } else {
         (s1.chars().count(), s2.chars().count())
     };
     
-    let total_len = len1 + len2;
-
-    if total_len == 0 {
-        return 100.0;
+    let total = len1 + len2;
+    
+    // Quick rejection based on length ratio
+    if let Some(cutoff) = score_cutoff {
+        // Maximum possible score
+        let max_possible = 100.0 * (2.0 * len1.min(len2) as f64) / (total as f64);
+        if max_possible < cutoff {
+            return 0.0;
+        }
     }
 
-    let lcs_len = lcs_length(s1, s2);
-    let similarity = 100.0 * (2.0 * lcs_len as f64) / (total_len as f64);
+    let lcs = lcs_length(s1, s2);
+    let similarity = 100.0 * (2.0 * lcs as f64) / (total as f64);
 
     match score_cutoff {
         Some(cutoff) if similarity < cutoff => 0.0,
@@ -152,7 +158,6 @@ mod tests {
 
     #[test]
     fn test_ratio() {
-        // Test against known RapidFuzz values
         let r = ratio("this is a test", "this is a test!", None);
         assert!((r - 96.55).abs() < 0.1);
     }

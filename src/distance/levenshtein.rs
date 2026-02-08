@@ -1,104 +1,35 @@
-//! Levenshtein distance algorithm - Ultra Optimized
+//! Levenshtein distance algorithm - Ultra Optimized with SIMD
 //!
-//! Uses multiple optimization techniques:
-//! 1. ASCII byte-level operations
-//! 2. SmallVec for stack allocation
-//! 3. Common prefix/suffix elimination
-//! 4. Diagonal banding for score_cutoff
-//! 5. Cache-friendly row-major access pattern
+//! Uses platform-specific SIMD for fast string comparison
+//! and loop unrolling for the DP computation.
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use smallvec::SmallVec;
+use std::cell::RefCell;
 
-// Stack-allocate arrays up to 128 elements
-type RowVec = SmallVec<[usize; 128]>;
+use crate::lcs_core::simd_str_equal;
 
-/// Ultra-optimized Levenshtein for ASCII bytes with banding
-#[inline(always)]
-fn levenshtein_ascii_banded(s1: &[u8], s2: &[u8], max_dist: usize) -> usize {
-    let mut m = s1.len();
-    let mut n = s2.len();
-    
-    // Length difference alone exceeds max_dist
-    if m.abs_diff(n) > max_dist {
-        return max_dist + 1;
-    }
-
-    // Make s1 the shorter string
-    let (s1, s2) = if m > n {
-        std::mem::swap(&mut m, &mut n);
-        (s2, s1)
-    } else {
-        (s1, s2)
-    };
-
-    // Empty string case
-    if m == 0 { return n; }
-
-    // Skip common prefix
-    let prefix_len = s1.iter().zip(s2.iter()).take_while(|(a, b)| a == b).count();
-    if prefix_len == m { return n - m; }
-    
-    let s1 = &s1[prefix_len..];
-    let s2 = &s2[prefix_len..];
-    let m = s1.len();
-    let n = s2.len();
-
-    // Skip common suffix
-    let suffix_len = s1.iter().rev().zip(s2.iter().rev()).take_while(|(a, b)| a == b).count();
-    let s1 = &s1[..m - suffix_len];
-    let s2 = &s2[..n - suffix_len];
-    let m = s1.len();
-    let n = s2.len();
-
-    if m == 0 { return n; }
-
-    // Use banded computation - only compute cells within max_dist of diagonal
-    let band_width = max_dist + 1;
-    
-    // Single row with sentinel values
-    let mut row: RowVec = (0..=m).collect();
-    
-    for (j, c2) in s2.iter().enumerate() {
-        let j1 = j + 1;
-        
-        // Band boundaries
-        let start = if j1 > band_width { j1 - band_width } else { 0 };
-        let end = (j1 + band_width).min(m);
-        
-        let mut prev_diag = row[start];
-        row[start] = if start == 0 { j1 } else { max_dist + 1 };
-        
-        for i in start..end {
-            let i1 = i + 1;
-            let old_diag = row[i1];
-            
-            let sub_cost = prev_diag + (s1[i] != *c2) as usize;
-            let del_cost = row[i1] + 1;
-            let ins_cost = row[i] + 1;
-            
-            row[i1] = sub_cost.min(del_cost).min(ins_cost);
-            prev_diag = old_diag;
-        }
-        
-        // Early termination: if minimum in row exceeds max_dist, abort
-        if j1 < n && row[start..=end.min(m)].iter().all(|&x| x > max_dist) {
-            return max_dist + 1;
-        }
-    }
-
-    row[m]
+// Thread-local buffers
+thread_local! {
+    static LEV_BUF: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(256));
 }
 
-/// Ultra-optimized Levenshtein for ASCII bytes (no banding)
+type RowVec = SmallVec<[usize; 128]>;
+
+/// Ultra-optimized Levenshtein for ASCII with loop unrolling
 #[inline(always)]
-fn levenshtein_ascii_full(s1: &[u8], s2: &[u8]) -> usize {
+fn levenshtein_ascii_unrolled(s1: &[u8], s2: &[u8]) -> usize {
     let mut m = s1.len();
     let mut n = s2.len();
 
     if m == 0 { return n; }
     if n == 0 { return m; }
+    
+    // SIMD equality check
+    if m == n && simd_str_equal(s1, s2) {
+        return 0;
+    }
 
     // Make s1 shorter
     let (s1, s2) = if m > n {
@@ -108,7 +39,7 @@ fn levenshtein_ascii_full(s1: &[u8], s2: &[u8]) -> usize {
         (s1, s2)
     };
 
-    // Skip common prefix
+    // Skip common prefix using SIMD-friendly comparison
     let prefix_len = s1.iter().zip(s2.iter()).take_while(|(a, b)| a == b).count();
     if prefix_len == m { return n - m; }
     
@@ -127,28 +58,51 @@ fn levenshtein_ascii_full(s1: &[u8], s2: &[u8]) -> usize {
     if m == 0 { return n; }
     if n == 0 { return m; }
 
-    // Optimized single-row computation
-    let mut row: RowVec = (0..=m).collect();
-    
-    for c2 in s2.iter() {
-        let mut prev_diag = row[0];
-        row[0] += 1;
+    // Use thread-local buffer
+    LEV_BUF.with(|buf| {
+        let mut row = buf.borrow_mut();
+        row.clear();
+        row.extend(0..=m);
         
-        for (i, c1) in s1.iter().enumerate() {
-            let old_diag = row[i + 1];
-            row[i + 1] = if *c1 == *c2 {
-                prev_diag
-            } else {
-                prev_diag.min(row[i + 1]).min(row[i]) + 1
-            };
-            prev_diag = old_diag;
+        for c2 in s2.iter() {
+            let mut prev_diag = row[0];
+            row[0] += 1;
+            
+            // Unrolled loop - process 4 elements at a time
+            let mut i = 0;
+            while i + 4 <= m {
+                let old0 = row[i + 1];
+                let old1 = row[i + 2];
+                let old2 = row[i + 3];
+                let old3 = row[i + 4];
+                
+                row[i + 1] = if s1[i] == *c2 { prev_diag } else { prev_diag.min(row[i + 1]).min(row[i]) + 1 };
+                row[i + 2] = if s1[i + 1] == *c2 { old0 } else { old0.min(row[i + 2]).min(row[i + 1]) + 1 };
+                row[i + 3] = if s1[i + 2] == *c2 { old1 } else { old1.min(row[i + 3]).min(row[i + 2]) + 1 };
+                row[i + 4] = if s1[i + 3] == *c2 { old2 } else { old2.min(row[i + 4]).min(row[i + 3]) + 1 };
+                
+                prev_diag = old3;
+                i += 4;
+            }
+            
+            // Handle remaining elements
+            while i < m {
+                let old_diag = row[i + 1];
+                row[i + 1] = if s1[i] == *c2 {
+                    prev_diag
+                } else {
+                    prev_diag.min(row[i + 1]).min(row[i]) + 1
+                };
+                prev_diag = old_diag;
+                i += 1;
+            }
         }
-    }
-
-    row[m]
+        
+        row[m]
+    })
 }
 
-/// Levenshtein for Unicode with prefix/suffix optimization
+/// Levenshtein for Unicode
 #[inline(always)]
 fn levenshtein_unicode(s1: &str, s2: &str) -> usize {
     let s1_chars: SmallVec<[char; 64]> = s1.chars().collect();
@@ -159,6 +113,7 @@ fn levenshtein_unicode(s1: &str, s2: &str) -> usize {
 
     if m == 0 { return n; }
     if n == 0 { return m; }
+    if s1_chars == s2_chars { return 0; }
 
     let (s1_chars, s2_chars) = if m > n {
         std::mem::swap(&mut m, &mut n);
@@ -206,30 +161,15 @@ fn levenshtein_unicode(s1: &str, s2: &str) -> usize {
     row[m]
 }
 
-/// Calculate the Levenshtein distance between two strings.
+/// Main entry point
 #[inline(always)]
 fn levenshtein_distance_internal(s1: &str, s2: &str) -> usize {
-    // Fast path for identical strings
-    if s1 == s2 { return 0; }
-    
-    // ASCII fast path
-    if s1.is_ascii() && s2.is_ascii() {
-        return levenshtein_ascii_full(s1.as_bytes(), s2.as_bytes());
-    }
-    
-    levenshtein_unicode(s1, s2)
-}
-
-/// Calculate the Levenshtein distance with optional score_cutoff for banding
-#[inline(always)]
-fn levenshtein_distance_with_cutoff(s1: &str, s2: &str, max_dist: usize) -> usize {
     if s1 == s2 { return 0; }
     
     if s1.is_ascii() && s2.is_ascii() {
-        return levenshtein_ascii_banded(s1.as_bytes(), s2.as_bytes(), max_dist);
+        return levenshtein_ascii_unrolled(s1.as_bytes(), s2.as_bytes());
     }
     
-    // For Unicode, fall back to full computation
     levenshtein_unicode(s1, s2)
 }
 
@@ -237,12 +177,10 @@ fn levenshtein_distance_with_cutoff(s1: &str, s2: &str, max_dist: usize) -> usiz
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn levenshtein_distance(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usize {
+    let dist = levenshtein_distance_internal(s1, s2);
     match score_cutoff {
-        Some(cutoff) => {
-            let dist = levenshtein_distance_with_cutoff(s1, s2, cutoff);
-            if dist > cutoff { cutoff + 1 } else { dist }
-        }
-        None => levenshtein_distance_internal(s1, s2),
+        Some(cutoff) if dist > cutoff => cutoff + 1,
+        _ => dist,
     }
 }
 
@@ -298,50 +236,26 @@ pub fn levenshtein_normalized_similarity(s1: &str, s2: &str, score_cutoff: Optio
 
 #[pyfunction]
 #[pyo3(signature = (pairs, *, score_cutoff=None))]
-pub fn levenshtein_distance_batch(
-    pairs: Vec<(String, String)>,
-    score_cutoff: Option<usize>,
-) -> Vec<usize> {
-    pairs
-        .par_iter()
-        .map(|(s1, s2)| levenshtein_distance(s1, s2, score_cutoff))
-        .collect()
+pub fn levenshtein_distance_batch(pairs: Vec<(String, String)>, score_cutoff: Option<usize>) -> Vec<usize> {
+    pairs.par_iter().map(|(s1, s2)| levenshtein_distance(s1, s2, score_cutoff)).collect()
 }
 
 #[pyfunction]
 #[pyo3(signature = (pairs, *, score_cutoff=None))]
-pub fn levenshtein_similarity_batch(
-    pairs: Vec<(String, String)>,
-    score_cutoff: Option<usize>,
-) -> Vec<usize> {
-    pairs
-        .par_iter()
-        .map(|(s1, s2)| levenshtein_similarity(s1, s2, score_cutoff))
-        .collect()
+pub fn levenshtein_similarity_batch(pairs: Vec<(String, String)>, score_cutoff: Option<usize>) -> Vec<usize> {
+    pairs.par_iter().map(|(s1, s2)| levenshtein_similarity(s1, s2, score_cutoff)).collect()
 }
 
 #[pyfunction]
 #[pyo3(signature = (pairs, *, score_cutoff=None))]
-pub fn levenshtein_normalized_distance_batch(
-    pairs: Vec<(String, String)>,
-    score_cutoff: Option<f64>,
-) -> Vec<f64> {
-    pairs
-        .par_iter()
-        .map(|(s1, s2)| levenshtein_normalized_distance(s1, s2, score_cutoff))
-        .collect()
+pub fn levenshtein_normalized_distance_batch(pairs: Vec<(String, String)>, score_cutoff: Option<f64>) -> Vec<f64> {
+    pairs.par_iter().map(|(s1, s2)| levenshtein_normalized_distance(s1, s2, score_cutoff)).collect()
 }
 
 #[pyfunction]
 #[pyo3(signature = (pairs, *, score_cutoff=None))]
-pub fn levenshtein_normalized_similarity_batch(
-    pairs: Vec<(String, String)>,
-    score_cutoff: Option<f64>,
-) -> Vec<f64> {
-    pairs
-        .par_iter()
-        .map(|(s1, s2)| levenshtein_normalized_similarity(s1, s2, score_cutoff))
-        .collect()
+pub fn levenshtein_normalized_similarity_batch(pairs: Vec<(String, String)>, score_cutoff: Option<f64>) -> Vec<f64> {
+    pairs.par_iter().map(|(s1, s2)| levenshtein_normalized_similarity(s1, s2, score_cutoff)).collect()
 }
 
 #[cfg(test)]
@@ -358,18 +272,9 @@ mod tests {
     }
 
     #[test]
-    fn test_banded() {
-        assert_eq!(levenshtein_distance_with_cutoff("kitten", "sitting", 5), 3);
-        assert_eq!(levenshtein_distance_with_cutoff("kitten", "sitting", 2), 3); // exceeds
-    }
-
-    #[test]
     fn test_prefix_suffix() {
-        // Common prefix
         assert_eq!(levenshtein_distance_internal("prefix_abc", "prefix_abd"), 1);
-        // Common suffix  
         assert_eq!(levenshtein_distance_internal("abc_suffix", "abd_suffix"), 1);
-        // Both
         assert_eq!(levenshtein_distance_internal("pre_abc_suf", "pre_abd_suf"), 1);
     }
 }

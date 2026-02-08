@@ -1,160 +1,31 @@
-//! Partial token ratio algorithms - Ultra Optimized
+//! Partial token ratio algorithms - Ultra Optimized V2
 //!
-//! Optimizations:
-//! 1. Shared partial_ratio computation
-//! 2. Lazy string building
-//! 3. Early termination paths
-//! 4. ASCII-optimized sliding window
+//! Uses lcs_core with thread-local buffers for maximum performance.
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use ahash::AHashSet;
 use std::cmp::max;
+use std::cell::RefCell;
+
+use crate::lcs_core::{lcs_fast, ratio_from_lcs};
 
 type TokenVec<'a> = SmallVec<[&'a str; 16]>;
-type RowVec = SmallVec<[usize; 128]>;
 
-/// Tokenize a string
+// Thread-local buffers for partial ratio sliding window
+thread_local! {
+    static PARTIAL_BUF_1: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(128));
+    static PARTIAL_BUF_2: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(128));
+}
+
+/// Tokenize inline
 #[inline(always)]
-fn tokenize(s: &str) -> TokenVec {
+fn tokenize<'a>(s: &'a str) -> TokenVec<'a> {
     s.split_whitespace().collect()
 }
 
-/// Ultra-fast LCS for ASCII bytes
-#[inline(always)]
-fn lcs_ascii(s1: &[u8], s2: &[u8]) -> usize {
-    let m = s1.len();
-    let n = s2.len();
-    if m == 0 || n == 0 { return 0; }
-    
-    let (s1, s2, m, _n) = if m > n { (s2, s1, n, m) } else { (s1, s2, m, n) };
-
-    let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
-    let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
-
-    for c2 in s2.iter() {
-        for (i, c1) in s1.iter().enumerate() {
-            curr[i + 1] = if *c1 == *c2 { prev[i] + 1 } else { max(prev[i + 1], curr[i]) };
-        }
-        std::mem::swap(&mut prev, &mut curr);
-        curr.fill(0);
-    }
-    prev[m]
-}
-
-/// LCS for strings
-#[inline(always)]
-fn lcs_str(s1: &str, s2: &str) -> usize {
-    if s1.is_ascii() && s2.is_ascii() {
-        return lcs_ascii(s1.as_bytes(), s2.as_bytes());
-    }
-    
-    let s1: SmallVec<[char; 64]> = s1.chars().collect();
-    let s2: SmallVec<[char; 64]> = s2.chars().collect();
-    
-    let m = s1.len();
-    let n = s2.len();
-    if m == 0 || n == 0 { return 0; }
-    
-    let (s1, s2, m, _n) = if m > n { (&s2[..], &s1[..], n, m) } else { (&s1[..], &s2[..], m, n) };
-
-    let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
-    let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
-
-    for c2 in s2.iter() {
-        for (i, c1) in s1.iter().enumerate() {
-            curr[i + 1] = if *c1 == *c2 { prev[i] + 1 } else { max(prev[i + 1], curr[i]) };
-        }
-        std::mem::swap(&mut prev, &mut curr);
-        curr.fill(0);
-    }
-    prev[m]
-}
-
-/// Calculate ratio from lengths and LCS
-#[inline(always)]
-fn ratio_from_parts(len1: usize, len2: usize, lcs: usize) -> f64 {
-    let total = len1 + len2;
-    if total == 0 { return 100.0; }
-    100.0 * (2.0 * lcs as f64) / (total as f64)
-}
-
-/// Optimized partial ratio for ASCII bytes
-#[inline(always)]
-fn partial_ratio_ascii(s1: &[u8], s2: &[u8]) -> f64 {
-    let len1 = s1.len();
-    let len2 = s2.len();
-
-    if len1 == 0 && len2 == 0 { return 100.0; }
-    if len1 == 0 || len2 == 0 { return 0.0; }
-
-    let (shorter, longer) = if len1 <= len2 { (s1, s2) } else { (s2, s1) };
-    let short_len = shorter.len();
-    let long_len = longer.len();
-
-    let mut best = 0.0f64;
-
-    for i in 0..=(long_len - short_len) {
-        let window = &longer[i..i + short_len];
-        let lcs = lcs_ascii(shorter, window);
-        let score = ratio_from_parts(short_len, short_len, lcs);
-        if score > best { best = score; }
-        if best >= 100.0 { break; }
-    }
-    best
-}
-
-/// Optimized partial ratio for strings
-#[inline(always)]
-pub fn partial_ratio_internal(s1: &str, s2: &str) -> f64 {
-    if s1 == s2 { return 100.0; }
-    
-    // ASCII fast path
-    if s1.is_ascii() && s2.is_ascii() {
-        return partial_ratio_ascii(s1.as_bytes(), s2.as_bytes());
-    }
-
-    // Unicode path
-    let s1: SmallVec<[char; 64]> = s1.chars().collect();
-    let s2: SmallVec<[char; 64]> = s2.chars().collect();
-    
-    let len1 = s1.len();
-    let len2 = s2.len();
-
-    if len1 == 0 && len2 == 0 { return 100.0; }
-    if len1 == 0 || len2 == 0 { return 0.0; }
-
-    let (shorter, longer) = if len1 <= len2 { (&s1[..], &s2[..]) } else { (&s2[..], &s1[..]) };
-    let short_len = shorter.len();
-    let long_len = longer.len();
-
-    let mut best = 0.0f64;
-    let mut prev: RowVec = SmallVec::from_elem(0, short_len + 1);
-    let mut curr: RowVec = SmallVec::from_elem(0, short_len + 1);
-
-    for i in 0..=(long_len - short_len) {
-        let window = &longer[i..i + short_len];
-        
-        // Inline LCS computation
-        prev.fill(0);
-        for c2 in window.iter() {
-            curr.fill(0);
-            for (j, c1) in shorter.iter().enumerate() {
-                curr[j + 1] = if *c1 == *c2 { prev[j] + 1 } else { max(prev[j + 1], curr[j]) };
-            }
-            std::mem::swap(&mut prev, &mut curr);
-        }
-        
-        let lcs = prev[short_len];
-        let score = ratio_from_parts(short_len, short_len, lcs);
-        if score > best { best = score; }
-        if best >= 100.0 { break; }
-    }
-    best
-}
-
-/// Join tokens efficiently
+/// Efficient join
 #[inline(always)]
 fn join_tokens(tokens: &[&str]) -> String {
     if tokens.is_empty() { return String::new(); }
@@ -168,6 +39,127 @@ fn join_tokens(tokens: &[&str]) -> String {
         result.push_str(t);
     }
     result
+}
+
+/// Ultra-optimized partial ratio for ASCII with thread-local buffers 
+#[inline(always)]
+fn partial_ratio_ascii_optimized(shorter: &[u8], longer: &[u8]) -> f64 {
+    let short_len = shorter.len();
+    let long_len = longer.len();
+    
+    let mut best = 0.0f64;
+    
+    PARTIAL_BUF_1.with(|buf1| {
+        PARTIAL_BUF_2.with(|buf2| {
+            let mut prev = buf1.borrow_mut();
+            let mut curr = buf2.borrow_mut();
+            
+            prev.clear();
+            prev.resize(short_len + 1, 0);
+            curr.clear();
+            curr.resize(short_len + 1, 0);
+            
+            for i in 0..=(long_len - short_len) {
+                let window = &longer[i..i + short_len];
+                
+                // Compute LCS for this window
+                prev.fill(0);
+                for c2 in window.iter() {
+                    curr.fill(0);
+                    for (j, c1) in shorter.iter().enumerate() {
+                        curr[j + 1] = if *c1 == *c2 {
+                            prev[j] + 1
+                        } else {
+                            max(prev[j + 1], curr[j])
+                        };
+                    }
+                    std::mem::swap(&mut *prev, &mut *curr);
+                }
+                
+                let lcs = prev[short_len];
+                let score = ratio_from_lcs(short_len, short_len, lcs);
+                if score > best { best = score; }
+                if best >= 100.0 { break; }
+            }
+        })
+    });
+    
+    best
+}
+
+/// Optimized partial ratio for strings
+#[inline(always)]
+pub fn partial_ratio_internal(s1: &str, s2: &str) -> f64 {
+    if s1 == s2 { return 100.0; }
+    if s1.is_empty() && s2.is_empty() { return 100.0; }
+    if s1.is_empty() || s2.is_empty() { return 0.0; }
+    
+    let (len1, len2) = if s1.is_ascii() && s2.is_ascii() {
+        (s1.len(), s2.len())
+    } else {
+        (s1.chars().count(), s2.chars().count())
+    };
+    
+    // ASCII fast path
+    if s1.is_ascii() && s2.is_ascii() {
+        let (shorter, longer) = if len1 <= len2 {
+            (s1.as_bytes(), s2.as_bytes())
+        } else {
+            (s2.as_bytes(), s1.as_bytes())
+        };
+        return partial_ratio_ascii_optimized(shorter, longer);
+    }
+    
+    // Unicode path - use lcs_fast for each window
+    let s1_chars: SmallVec<[char; 64]> = s1.chars().collect();
+    let s2_chars: SmallVec<[char; 64]> = s2.chars().collect();
+    
+    let (shorter, longer) = if s1_chars.len() <= s2_chars.len() {
+        (&s1_chars[..], &s2_chars[..])
+    } else {
+        (&s2_chars[..], &s1_chars[..])
+    };
+    
+    let short_len = shorter.len();
+    let long_len = longer.len();
+    
+    let mut best = 0.0f64;
+    
+    PARTIAL_BUF_1.with(|buf1| {
+        PARTIAL_BUF_2.with(|buf2| {
+            let mut prev = buf1.borrow_mut();
+            let mut curr = buf2.borrow_mut();
+            
+            prev.clear();
+            prev.resize(short_len + 1, 0);
+            curr.clear();
+            curr.resize(short_len + 1, 0);
+            
+            for i in 0..=(long_len - short_len) {
+                let window = &longer[i..i + short_len];
+                
+                prev.fill(0);
+                for c2 in window.iter() {
+                    curr.fill(0);
+                    for (j, c1) in shorter.iter().enumerate() {
+                        curr[j + 1] = if *c1 == *c2 {
+                            prev[j] + 1
+                        } else {
+                            max(prev[j + 1], curr[j])
+                        };
+                    }
+                    std::mem::swap(&mut *prev, &mut *curr);
+                }
+                
+                let lcs = prev[short_len];
+                let score = ratio_from_lcs(short_len, short_len, lcs);
+                if score > best { best = score; }
+                if best >= 100.0 { break; }
+            }
+        })
+    });
+    
+    best
 }
 
 /// Partial token sort ratio
@@ -195,7 +187,7 @@ pub fn partial_token_sort_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -
     }
 }
 
-/// Partial token set ratio - Heavily optimized
+/// Partial token set ratio
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn partial_token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
@@ -240,7 +232,6 @@ pub fn partial_token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) ->
         format!("{} {}", inter_str, join_tokens(&diff2))
     };
     
-    // Compute all three and take max
     let r1 = partial_ratio_internal(&inter_str, &combined1);
     let r2 = partial_ratio_internal(&inter_str, &combined2);
     let r3 = partial_ratio_internal(&combined1, &combined2);
@@ -253,16 +244,14 @@ pub fn partial_token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) ->
     }
 }
 
-/// Partial token ratio - max of sort and set variants
+/// Partial token ratio - max of both
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn partial_token_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
     if s1 == s2 { return 100.0; }
     
-    // Compute sort first (often cheaper)
     let sort_result = partial_token_sort_ratio(s1, s2, None);
     
-    // Early exit if already at max
     if sort_result >= 100.0 {
         return match score_cutoff {
             Some(cutoff) if sort_result < cutoff => 0.0,

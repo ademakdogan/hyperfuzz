@@ -1,138 +1,49 @@
-//! Ratio algorithm - Ultra Optimized
+//! Ratio algorithm - Ultra Optimized using lcs_core
 //!
-//! Uses Indel similarity (LCS-based): 100 * 2 * LCS / (len1 + len2)
+//! Uses thread-local buffers from lcs_core for zero-allocation LCS computation.
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use smallvec::SmallVec;
-use std::cmp::max;
 
-type RowVec = SmallVec<[usize; 128]>;
+use crate::lcs_core::{lcs_fast, ratio_from_lcs};
 
-/// Ultra-fast LCS for ASCII bytes with cache-friendly access
-#[inline(always)]
-fn lcs_ascii(s1: &[u8], s2: &[u8]) -> usize {
-    let m = s1.len();
-    let n = s2.len();
-    
-    if m == 0 || n == 0 { return 0; }
-    
-    // Make s1 shorter for better cache behavior
-    let (s1, s2, m, n) = if m > n {
-        (s2, s1, n, m)
-    } else {
-        (s1, s2, m, n)
-    };
-
-    // Optimized single-row DP with manual loop unrolling potential
-    let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
-    let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
-
-    for c2 in s2.iter() {
-        // Process in chunks for better cache utilization
-        for i in 0..m {
-            curr[i + 1] = if s1[i] == *c2 {
-                prev[i] + 1
-            } else {
-                max(prev[i + 1], curr[i])
-            };
-        }
-        std::mem::swap(&mut prev, &mut curr);
-        // Only fill if there's another iteration
-        if n > 1 {
-            curr.fill(0);
-        }
-    }
-
-    prev[m]
-}
-
-/// LCS for Unicode chars
-#[inline(always)]
-fn lcs_unicode(s1: &[char], s2: &[char]) -> usize {
-    let m = s1.len();
-    let n = s2.len();
-    
-    if m == 0 || n == 0 { return 0; }
-    
-    let (s1, s2, m, _n) = if m > n {
-        (s2, s1, n, m)
-    } else {
-        (s1, s2, m, n)
-    };
-
-    let mut prev: RowVec = SmallVec::from_elem(0, m + 1);
-    let mut curr: RowVec = SmallVec::from_elem(0, m + 1);
-
-    for c2 in s2.iter() {
-        for i in 0..m {
-            curr[i + 1] = if s1[i] == *c2 {
-                prev[i] + 1
-            } else {
-                max(prev[i + 1], curr[i])
-            };
-        }
-        std::mem::swap(&mut prev, &mut curr);
-        curr.fill(0);
-    }
-
-    prev[m]
-}
-
-/// Calculate LCS length
-#[inline(always)]
-pub fn lcs_length(s1: &str, s2: &str) -> usize {
-    if s1.is_ascii() && s2.is_ascii() {
-        return lcs_ascii(s1.as_bytes(), s2.as_bytes());
-    }
-    
-    let c1: SmallVec<[char; 64]> = s1.chars().collect();
-    let c2: SmallVec<[char; 64]> = s2.chars().collect();
-    lcs_unicode(&c1, &c2)
-}
-
-/// Calculate ratio - Ultra optimized
+/// Calculate ratio using lcs_core optimizations
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
-    // Fast path for identical strings
-    if s1 == s2 {
-        return 100.0;
-    }
+    // Fast paths
+    if s1 == s2 { return 100.0; }
+    if s1.is_empty() && s2.is_empty() { return 100.0; }
+    if s1.is_empty() || s2.is_empty() { return 0.0; }
     
-    // Fast path for empty strings
-    if s1.is_empty() && s2.is_empty() {
-        return 100.0;
-    }
-    if s1.is_empty() || s2.is_empty() {
-        return 0.0;
-    }
-    
-    // Get lengths - ASCII fast path
+    // Get lengths efficiently
     let (len1, len2) = if s1.is_ascii() && s2.is_ascii() {
         (s1.len(), s2.len())
     } else {
         (s1.chars().count(), s2.chars().count())
     };
     
-    let total = len1 + len2;
-    
-    // Quick rejection based on length ratio
+    // Early rejection based on length ratio
     if let Some(cutoff) = score_cutoff {
-        // Maximum possible score
-        let max_possible = 100.0 * (2.0 * len1.min(len2) as f64) / (total as f64);
+        let max_possible = 100.0 * (2.0 * len1.min(len2) as f64) / ((len1 + len2) as f64);
         if max_possible < cutoff {
             return 0.0;
         }
     }
 
-    let lcs = lcs_length(s1, s2);
-    let similarity = 100.0 * (2.0 * lcs as f64) / (total as f64);
+    let lcs = lcs_fast(s1, s2);
+    let similarity = ratio_from_lcs(len1, len2, lcs);
 
     match score_cutoff {
         Some(cutoff) if similarity < cutoff => 0.0,
         _ => similarity,
     }
+}
+
+/// Re-export lcs_length for other modules
+#[inline(always)]
+pub fn lcs_length(s1: &str, s2: &str) -> usize {
+    lcs_fast(s1, s2)
 }
 
 /// Calculate ratio for batch of string pairs.

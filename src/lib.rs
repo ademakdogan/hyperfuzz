@@ -10,6 +10,7 @@ mod fuzz;
 mod set_based;
 mod alignment;
 mod vector;
+mod lcs_core;
 
 /// HyperFuzz Python module
 #[pymodule]

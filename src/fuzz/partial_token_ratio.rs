@@ -1,6 +1,9 @@
-//! Partial token ratio algorithms - Ultra Optimized V2
+//! Partial token ratio algorithms - RapidFuzz-inspired optimizations
 //!
-//! Uses lcs_core with thread-local buffers for maximum performance.
+//! Key optimizations from RapidFuzz:
+//! 1. Early exit when intersection exists (return 100)
+//! 2. Avoid duplicate partial_ratio calculations
+//! 3. Reuse token sets
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -9,7 +12,7 @@ use ahash::AHashSet;
 use std::cmp::max;
 use std::cell::RefCell;
 
-use crate::lcs_core::{lcs_fast, ratio_from_lcs};
+use crate::lcs_core::ratio_from_lcs;
 
 type TokenVec<'a> = SmallVec<[&'a str; 16]>;
 
@@ -19,13 +22,11 @@ thread_local! {
     static PARTIAL_BUF_2: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(128));
 }
 
-/// Tokenize inline
 #[inline(always)]
 fn tokenize<'a>(s: &'a str) -> TokenVec<'a> {
     s.split_whitespace().collect()
 }
 
-/// Efficient join
 #[inline(always)]
 fn join_tokens(tokens: &[&str]) -> String {
     if tokens.is_empty() { return String::new(); }
@@ -41,7 +42,7 @@ fn join_tokens(tokens: &[&str]) -> String {
     result
 }
 
-/// Ultra-optimized partial ratio for ASCII with thread-local buffers 
+/// Optimized partial ratio for ASCII with thread-local buffers 
 #[inline(always)]
 fn partial_ratio_ascii_optimized(shorter: &[u8], longer: &[u8]) -> f64 {
     let short_len = shorter.len();
@@ -62,7 +63,6 @@ fn partial_ratio_ascii_optimized(shorter: &[u8], longer: &[u8]) -> f64 {
             for i in 0..=(long_len - short_len) {
                 let window = &longer[i..i + short_len];
                 
-                // Compute LCS for this window
                 prev.fill(0);
                 for c2 in window.iter() {
                     curr.fill(0);
@@ -110,7 +110,7 @@ pub fn partial_ratio_internal(s1: &str, s2: &str) -> f64 {
         return partial_ratio_ascii_optimized(shorter, longer);
     }
     
-    // Unicode path - use lcs_fast for each window
+    // Unicode path
     let s1_chars: SmallVec<[char; 64]> = s1.chars().collect();
     let s2_chars: SmallVec<[char; 64]> = s2.chars().collect();
     
@@ -187,7 +187,7 @@ pub fn partial_token_sort_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -
     }
 }
 
-/// Partial token set ratio
+/// Partial token set ratio - KEY OPTIMIZATION: return 100 if intersection exists
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn partial_token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
@@ -197,46 +197,24 @@ pub fn partial_token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) ->
     let tokens2: AHashSet<&str> = tokenize(s2).into_iter().collect();
     
     if tokens1 == tokens2 { return 100.0; }
-    if tokens1.is_empty() && tokens2.is_empty() { return 100.0; }
     if tokens1.is_empty() || tokens2.is_empty() { return 0.0; }
     
-    let mut inter: TokenVec = tokens1.intersection(&tokens2).copied().collect();
-    let mut diff1: TokenVec = tokens1.difference(&tokens2).copied().collect();
-    let mut diff2: TokenVec = tokens2.difference(&tokens1).copied().collect();
-    
-    inter.sort_unstable();
-    diff1.sort_unstable();
-    diff2.sort_unstable();
-    
-    let inter_str = join_tokens(&inter);
-    
-    if inter_str.is_empty() {
-        let c1 = join_tokens(&diff1);
-        let c2 = join_tokens(&diff2);
-        let result = partial_ratio_internal(&c1, &c2);
-        return match score_cutoff {
-            Some(cutoff) if result < cutoff => 0.0,
-            _ => result,
-        };
+    // KEY OPTIMIZATION from RapidFuzz: If there's any common word, return 100
+    if tokens1.intersection(&tokens2).next().is_some() {
+        return 100.0;
     }
     
-    let combined1 = if diff1.is_empty() {
-        inter_str.clone()
-    } else {
-        format!("{} {}", inter_str, join_tokens(&diff1))
-    };
+    // No intersection - compare sorted differences
+    let mut diff_ab: TokenVec = tokens1.difference(&tokens2).copied().collect();
+    let mut diff_ba: TokenVec = tokens2.difference(&tokens1).copied().collect();
     
-    let combined2 = if diff2.is_empty() {
-        inter_str.clone()
-    } else {
-        format!("{} {}", inter_str, join_tokens(&diff2))
-    };
+    diff_ab.sort_unstable();
+    diff_ba.sort_unstable();
     
-    let r1 = partial_ratio_internal(&inter_str, &combined1);
-    let r2 = partial_ratio_internal(&inter_str, &combined2);
-    let r3 = partial_ratio_internal(&combined1, &combined2);
+    let diff_ab_joined = join_tokens(&diff_ab);
+    let diff_ba_joined = join_tokens(&diff_ba);
     
-    let result = r1.max(r2).max(r3);
+    let result = partial_ratio_internal(&diff_ab_joined, &diff_ba_joined);
     
     match score_cutoff {
         Some(cutoff) if result < cutoff => 0.0,
@@ -244,23 +222,57 @@ pub fn partial_token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) ->
     }
 }
 
-/// Partial token ratio - max of both
+/// Partial token ratio - RapidFuzz algorithm
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn partial_token_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
     if s1 == s2 { return 100.0; }
     
-    let sort_result = partial_token_sort_ratio(s1, s2, None);
+    let score_cutoff_val = score_cutoff.unwrap_or(0.0);
     
-    if sort_result >= 100.0 {
+    let tokens_split_a = tokenize(s1);
+    let tokens_split_b = tokenize(s2);
+    let tokens_a: AHashSet<&str> = tokens_split_a.iter().copied().collect();
+    let tokens_b: AHashSet<&str> = tokens_split_b.iter().copied().collect();
+    
+    // KEY OPTIMIZATION: If there's any common word, return 100
+    if tokens_a.intersection(&tokens_b).next().is_some() {
+        return 100.0;
+    }
+    
+    let diff_ab: TokenVec = tokens_a.difference(&tokens_b).copied().collect();
+    let diff_ba: TokenVec = tokens_b.difference(&tokens_a).copied().collect();
+    
+    // Calculate partial_token_sort_ratio
+    let mut sorted_a: TokenVec = tokens_split_a.clone();
+    let mut sorted_b: TokenVec = tokens_split_b.clone();
+    sorted_a.sort_unstable();
+    sorted_b.sort_unstable();
+    
+    let sorted_a_str = join_tokens(&sorted_a);
+    let sorted_b_str = join_tokens(&sorted_b);
+    
+    let mut result = partial_ratio_internal(&sorted_a_str, &sorted_b_str);
+    
+    // Avoid duplicate calculation if sets are same as original tokens
+    if tokens_split_a.len() == diff_ab.len() && tokens_split_b.len() == diff_ba.len() {
         return match score_cutoff {
-            Some(cutoff) if sort_result < cutoff => 0.0,
-            _ => sort_result,
+            Some(cutoff) if result < cutoff => 0.0,
+            _ => result,
         };
     }
     
-    let set_result = partial_token_set_ratio(s1, s2, None);
-    let result = sort_result.max(set_result);
+    // Calculate partial ratio for differences
+    let mut diff_ab_sorted: TokenVec = diff_ab;
+    let mut diff_ba_sorted: TokenVec = diff_ba;
+    diff_ab_sorted.sort_unstable();
+    diff_ba_sorted.sort_unstable();
+    
+    let diff_ab_str = join_tokens(&diff_ab_sorted);
+    let diff_ba_str = join_tokens(&diff_ba_sorted);
+    
+    let diff_result = partial_ratio_internal(&diff_ab_str, &diff_ba_str);
+    result = result.max(diff_result);
     
     match score_cutoff {
         Some(cutoff) if result < cutoff => 0.0,
@@ -299,7 +311,14 @@ mod tests {
     }
     
     #[test]
-    fn test_partial_token_set_ratio() {
+    fn test_partial_token_set_ratio_intersection() {
+        // Any common word = 100
+        let r = partial_token_set_ratio("hello world", "world peace", None);
+        assert!((r - 100.0).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_partial_token_set_ratio_no_intersection() {
         let r = partial_token_set_ratio("kitten", "sitting", None);
         assert!((r - 66.67).abs() < 0.1);
     }

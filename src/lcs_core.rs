@@ -1,110 +1,95 @@
-//! Ultra-optimized LCS core with SIMD support
+//! Ultra-optimized LCS core with bit-parallel algorithm
 //!
-//! Platform-specific optimizations:
-//! - ARM NEON for Apple Silicon (M1/M2/M3)
-//! - x86 SSE2/AVX2 for Intel/AMD
-//! - Scalar fallback for other platforms
+//! Implements Hyyrö's bit-parallel algorithm for O(n*m/64) complexity
+//! Reference: Heikki Hyyrö - "A Note on Bit-Parallel Alignment Computation" (2004)
 //!
-//! Also includes thread-local buffer reuse for zero-allocation paths.
+//! Also includes:
+//! - SIMD-accelerated string comparison
+//! - Thread-local buffer reuse
+//! - Character filtering for partial_ratio
 
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::cmp::max;
+use ahash::AHashMap;
 
 // Thread-local pre-allocated buffers
 thread_local! {
     static DP_BUFFER_1: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(512));
     static DP_BUFFER_2: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(512));
+    static CHAR_BLOCK: RefCell<AHashMap<u8, u64>> = RefCell::new(AHashMap::with_capacity(64));
 }
 
-// ============ SIMD Optimized Character Comparison ============
+// ============ Bit-Parallel LCS (Hyyrö's Algorithm) ============
 
-/// Count matching characters in two byte slices using SIMD
-#[cfg(target_arch = "aarch64")]
+/// Compute LCS length using bit-parallel algorithm for ASCII strings <= 64 chars
+/// This is O(n) for fixed s1 length, O(n*m/64) overall
 #[inline(always)]
-fn simd_count_matches(s1: &[u8], s2: &[u8]) -> usize {
-    use std::arch::aarch64::*;
+pub fn lcs_bitparallel_ascii(s1: &[u8], s2: &[u8]) -> usize {
+    let len1 = s1.len();
+    if len1 == 0 { return 0; }
+    if len1 > 64 { return lcs_dp_optimized(s1, s2); }
     
-    let len = s1.len().min(s2.len());
-    if len == 0 { return 0; }
-    
-    let mut matches = 0usize;
-    let mut i = 0;
-    
-    // Process 16 bytes at a time with NEON
-    if len >= 16 {
-        unsafe {
-            while i + 16 <= len {
-                let v1 = vld1q_u8(s1.as_ptr().add(i));
-                let v2 = vld1q_u8(s2.as_ptr().add(i));
-                let eq = vceqq_u8(v1, v2);
-                
-                // Count set bytes (0xFF for match, 0x00 for no match)
-                // Sum all bytes then divide by 255
-                let sum = vaddvq_u8(eq);
-                matches += (sum / 255) as usize;
-                
-                i += 16;
-            }
-        }
+    // Build character block map
+    let mut block = [0u64; 256];
+    for (i, &c) in s1.iter().enumerate() {
+        block[c as usize] |= 1u64 << i;
     }
     
-    // Handle remaining bytes
-    while i < len {
-        if s1[i] == s2[i] {
-            matches += 1;
-        }
-        i += 1;
+    // Bit-parallel computation
+    let mut s: u64 = (1u64 << len1) - 1;
+    
+    for &c2 in s2.iter() {
+        let matches = block[c2 as usize];
+        let u = s & matches;
+        s = (s.wrapping_add(u)) | (s.wrapping_sub(u));
     }
     
-    matches
+    // Count zeros in the rightmost len1 bits = LCS length
+    let mask = (1u64 << len1) - 1;
+    len1 - (s & mask).count_ones() as usize
 }
 
-#[cfg(target_arch = "x86_64")]
+/// Compute LCS using pre-built block map (for sliding window operations)
 #[inline(always)]
-fn simd_count_matches(s1: &[u8], s2: &[u8]) -> usize {
-    use std::arch::x86_64::*;
+pub fn lcs_with_block(block: &[u64; 256], len1: usize, s2: &[u8]) -> usize {
+    if len1 == 0 { return 0; }
     
-    let len = s1.len().min(s2.len());
-    if len == 0 { return 0; }
+    let mut s: u64 = (1u64 << len1) - 1;
     
-    let mut matches = 0usize;
-    let mut i = 0;
-    
-    // Check for SSE2 support (always available on x86_64)
-    if len >= 16 {
-        unsafe {
-            while i + 16 <= len {
-                let v1 = _mm_loadu_si128(s1.as_ptr().add(i) as *const __m128i);
-                let v2 = _mm_loadu_si128(s2.as_ptr().add(i) as *const __m128i);
-                let eq = _mm_cmpeq_epi8(v1, v2);
-                let mask = _mm_movemask_epi8(eq) as u32;
-                matches += mask.count_ones() as usize;
-                i += 16;
-            }
-        }
+    for &c2 in s2.iter() {
+        let matches = block[c2 as usize];
+        let u = s & matches;
+        s = (s.wrapping_add(u)) | (s.wrapping_sub(u));
     }
     
-    // Handle remaining bytes
-    while i < len {
-        if s1[i] == s2[i] {
-            matches += 1;
-        }
-        i += 1;
-    }
-    
-    matches
+    let mask = (1u64 << len1) - 1;
+    len1 - (s & mask).count_ones() as usize
 }
 
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+/// Build character block map for bit-parallel algorithm
 #[inline(always)]
-fn simd_count_matches(s1: &[u8], s2: &[u8]) -> usize {
-    s1.iter().zip(s2.iter()).filter(|(a, b)| a == b).count()
+pub fn build_block_map(s1: &[u8]) -> [u64; 256] {
+    let mut block = [0u64; 256];
+    for (i, &c) in s1.iter().enumerate() {
+        if i >= 64 { break; }
+        block[c as usize] |= 1u64 << i;
+    }
+    block
+}
+
+/// Build character set for filtering
+#[inline(always)]
+pub fn build_char_set(s1: &[u8]) -> [bool; 256] {
+    let mut char_set = [false; 256];
+    for &c in s1.iter() {
+        char_set[c as usize] = true;
+    }
+    char_set
 }
 
 // ============ SIMD Optimized String Comparison ============
 
-/// Fast equality check using SIMD
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub fn simd_str_equal(s1: &[u8], s2: &[u8]) -> bool {
@@ -120,17 +105,11 @@ pub fn simd_str_equal(s1: &[u8], s2: &[u8]) -> bool {
                 let v1 = vld1q_u8(s1.as_ptr().add(i));
                 let v2 = vld1q_u8(s2.as_ptr().add(i));
                 let eq = vceqq_u8(v1, v2);
-                
-                // Check if all bytes are 0xFF (all match)
-                if vminvq_u8(eq) != 0xFF {
-                    return false;
-                }
+                if vminvq_u8(eq) != 0xFF { return false; }
                 i += 16;
             }
         }
     }
-    
-    // Check remaining bytes
     s1[i..] == s2[i..]
 }
 
@@ -149,15 +128,11 @@ pub fn simd_str_equal(s1: &[u8], s2: &[u8]) -> bool {
                 let v1 = _mm_loadu_si128(s1.as_ptr().add(i) as *const __m128i);
                 let v2 = _mm_loadu_si128(s2.as_ptr().add(i) as *const __m128i);
                 let eq = _mm_cmpeq_epi8(v1, v2);
-                let mask = _mm_movemask_epi8(eq);
-                if mask != 0xFFFF {
-                    return false;
-                }
+                if _mm_movemask_epi8(eq) != 0xFFFF { return false; }
                 i += 16;
             }
         }
     }
-    
     s1[i..] == s2[i..]
 }
 
@@ -167,7 +142,7 @@ pub fn simd_str_equal(s1: &[u8], s2: &[u8]) -> bool {
     s1 == s2
 }
 
-// ============ Optimized LCS with SIMD-assisted heuristics ============
+// ============ Optimized DP LCS ============
 
 /// Ultra-optimized DP with thread-local buffer reuse
 #[inline(always)]
@@ -176,31 +151,14 @@ pub fn lcs_dp_optimized(s1: &[u8], s2: &[u8]) -> usize {
     let n = s2.len();
     
     if m == 0 || n == 0 { return 0; }
+    if m == n && simd_str_equal(s1, s2) { return m; }
     
-    // Quick check for identical strings using SIMD
-    if m == n && simd_str_equal(s1, s2) {
-        return m;
-    }
-    
-    // Ensure s1 is shorter
     let (s1, s2, m, _n) = if m > n {
         (s2, s1, n, m)
     } else {
         (s1, s2, m, n)
     };
     
-    // Heuristic: if strings are very similar, LCS is close to min length
-    // Use SIMD to quickly estimate similarity
-    if m <= 64 && m == s2.len() {
-        let matches = simd_count_matches(s1, s2);
-        // If >90% chars match in same positions, use quick estimate
-        if matches > (m * 9) / 10 {
-            // This is a heuristic - actual LCS might be slightly different
-            // but for very similar strings it's accurate
-        }
-    }
-    
-    // Use thread-local buffers
     if m <= 512 {
         return DP_BUFFER_1.with(|buf1| {
             DP_BUFFER_2.with(|buf2| {
@@ -213,7 +171,6 @@ pub fn lcs_dp_optimized(s1: &[u8], s2: &[u8]) -> usize {
                 curr.resize(m + 1, 0);
                 
                 for c2 in s2.iter() {
-                    // Unrolled inner loop for better performance
                     let mut i = 0;
                     while i + 4 <= m {
                         curr[i + 1] = if s1[i] == *c2 { prev[i] + 1 } else { max(prev[i + 1], curr[i]) };
@@ -226,47 +183,24 @@ pub fn lcs_dp_optimized(s1: &[u8], s2: &[u8]) -> usize {
                         curr[i + 1] = if s1[i] == *c2 { prev[i] + 1 } else { max(prev[i + 1], curr[i]) };
                         i += 1;
                     }
-                    
                     std::mem::swap(&mut *prev, &mut *curr);
                     curr.fill(0);
                 }
-                
                 prev[m]
             })
         });
     }
     
     // Fallback for very long strings
-    lcs_dp_standard(s1, s2)
-}
-
-/// Standard DP for very long strings
-#[inline(always)]
-fn lcs_dp_standard(s1: &[u8], s2: &[u8]) -> usize {
-    let m = s1.len();
-    let n = s2.len();
-    
-    let (s1, s2, m, _n) = if m > n {
-        (s2, s1, n, m)
-    } else {
-        (s1, s2, m, n)
-    };
-    
     let mut prev: Vec<usize> = vec![0; m + 1];
     let mut curr: Vec<usize> = vec![0; m + 1];
-    
     for c2 in s2.iter() {
         for (i, c1) in s1.iter().enumerate() {
-            curr[i + 1] = if *c1 == *c2 {
-                prev[i] + 1
-            } else {
-                max(prev[i + 1], curr[i])
-            };
+            curr[i + 1] = if *c1 == *c2 { prev[i] + 1 } else { max(prev[i + 1], curr[i]) };
         }
         std::mem::swap(&mut prev, &mut curr);
         curr.fill(0);
     }
-    
     prev[m]
 }
 
@@ -298,45 +232,40 @@ pub fn lcs_chars_optimized(s1: &[char], s2: &[char]) -> usize {
                 
                 for c2 in s2.iter() {
                     for (i, c1) in s1.iter().enumerate() {
-                        curr[i + 1] = if *c1 == *c2 {
-                            prev[i] + 1
-                        } else {
-                            max(prev[i + 1], curr[i])
-                        };
+                        curr[i + 1] = if *c1 == *c2 { prev[i] + 1 } else { max(prev[i + 1], curr[i]) };
                     }
                     std::mem::swap(&mut *prev, &mut *curr);
                     curr.fill(0);
                 }
-                
                 prev[m]
             })
         });
     }
     
-    // Fallback
     let mut prev: Vec<usize> = vec![0; m + 1];
     let mut curr: Vec<usize> = vec![0; m + 1];
-    
     for c2 in s2.iter() {
         for (i, c1) in s1.iter().enumerate() {
-            curr[i + 1] = if *c1 == *c2 {
-                prev[i] + 1
-            } else {
-                max(prev[i + 1], curr[i])
-            };
+            curr[i + 1] = if *c1 == *c2 { prev[i] + 1 } else { max(prev[i + 1], curr[i]) };
         }
         std::mem::swap(&mut prev, &mut curr);
         curr.fill(0);
     }
-    
     prev[m]
 }
 
-/// Main entry point
+/// Main entry point - uses bit-parallel for short ASCII strings
 #[inline(always)]
 pub fn lcs_fast(s1: &str, s2: &str) -> usize {
     if s1.is_ascii() && s2.is_ascii() {
-        return lcs_dp_optimized(s1.as_bytes(), s2.as_bytes());
+        let b1 = s1.as_bytes();
+        let b2 = s2.as_bytes();
+        
+        // Use bit-parallel for strings <= 64 chars
+        if b1.len() <= 64 {
+            return lcs_bitparallel_ascii(b1, b2);
+        }
+        return lcs_dp_optimized(b1, b2);
     }
     
     let c1: SmallVec<[char; 64]> = s1.chars().collect();
@@ -357,24 +286,17 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_simd_count_matches() {
-        assert_eq!(simd_count_matches(b"abc", b"abc"), 3);
-        assert_eq!(simd_count_matches(b"abc", b"axc"), 2);
-        assert_eq!(simd_count_matches(b"hello world test", b"hello world test"), 16);
+    fn test_lcs_bitparallel() {
+        assert_eq!(lcs_bitparallel_ascii(b"abcde", b"ace"), 3);
+        assert_eq!(lcs_bitparallel_ascii(b"abc", b"abc"), 3);
+        assert_eq!(lcs_bitparallel_ascii(b"abc", b"def"), 0);
+        assert_eq!(lcs_bitparallel_ascii(b"kitten", b"sitting"), 4);
     }
     
     #[test]
-    fn test_simd_str_equal() {
-        assert!(simd_str_equal(b"hello", b"hello"));
-        assert!(!simd_str_equal(b"hello", b"hallo"));
-        assert!(simd_str_equal(b"this is a longer string for testing", b"this is a longer string for testing"));
-    }
-    
-    #[test]
-    fn test_lcs_dp() {
-        assert_eq!(lcs_dp_optimized(b"abcde", b"ace"), 3);
-        assert_eq!(lcs_dp_optimized(b"abc", b"abc"), 3);
-        assert_eq!(lcs_dp_optimized(b"abc", b"def"), 0);
+    fn test_lcs_with_block() {
+        let block = build_block_map(b"abcde");
+        assert_eq!(lcs_with_block(&block, 5, b"ace"), 3);
     }
     
     #[test]

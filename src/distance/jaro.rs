@@ -1,31 +1,89 @@
-//! Jaro similarity algorithm - Optimized
+//! Jaro similarity algorithm - Optimized with bit-vector matching
 //!
-//! Measures similarity between two strings based on matching characters
-//! and transpositions.
+//! Uses bit-vectors for faster matching window computation
+//! when dealing with ASCII strings <= 64 characters.
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::cmp::{max, min};
 
-// Stack allocation for typical string lengths
 type CharVec = SmallVec<[char; 64]>;
 type BoolVec = SmallVec<[bool; 64]>;
 
-/// Calculate Jaro similarity for ASCII strings (byte-level)
+/// Bit-vector based Jaro for ASCII strings <= 64 chars
 #[inline(always)]
-fn jaro_similarity_ascii(s1: &[u8], s2: &[u8]) -> f64 {
+fn jaro_bitparallel_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     let len1 = s1.len();
     let len2 = s2.len();
 
-    if len1 == 0 && len2 == 0 {
-        return 1.0;
+    if len1 == 0 && len2 == 0 { return 1.0; }
+    if len1 == 0 || len2 == 0 { return 0.0; }
+
+    let match_distance = max(len1, len2) / 2;
+    let match_distance = if match_distance > 0 { match_distance - 1 } else { 0 };
+
+    // Use u64 bit vectors for match flags (works for strings <= 64 chars)
+    let mut s1_matches: u64 = 0;
+    let mut s2_matches: u64 = 0;
+    let mut matches = 0usize;
+
+    // Find matching characters using bit operations
+    for i in 0..len1 {
+        let start = i.saturating_sub(match_distance);
+        let end = min(i + match_distance + 1, len2);
+
+        for j in start..end {
+            // Check if s2[j] already matched
+            if (s2_matches >> j) & 1 != 0 {
+                continue;
+            }
+            if s1[i] != s2[j] {
+                continue;
+            }
+            s1_matches |= 1u64 << i;
+            s2_matches |= 1u64 << j;
+            matches += 1;
+            break;
+        }
     }
-    if len1 == 0 || len2 == 0 {
+
+    if matches == 0 {
         return 0.0;
     }
 
-    // Match window size
+    // Count transpositions using bit scanning
+    let mut transpositions = 0usize;
+    let mut k = 0;
+    for i in 0..len1 {
+        if (s1_matches >> i) & 1 == 0 {
+            continue;
+        }
+        // Find next matched position in s2
+        while (s2_matches >> k) & 1 == 0 {
+            k += 1;
+        }
+        if s1[i] != s2[k] {
+            transpositions += 1;
+        }
+        k += 1;
+    }
+
+    let m = matches as f64;
+    let t = (transpositions / 2) as f64;
+
+    (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
+}
+
+/// Standard Jaro for ASCII (fallback for >64 chars)
+#[inline(always)]
+fn jaro_standard_ascii(s1: &[u8], s2: &[u8]) -> f64 {
+    let len1 = s1.len();
+    let len2 = s2.len();
+
+    if len1 == 0 && len2 == 0 { return 1.0; }
+    if len1 == 0 || len2 == 0 { return 0.0; }
+
     let match_distance = max(len1, len2) / 2;
     let match_distance = if match_distance > 0 { match_distance - 1 } else { 0 };
 
@@ -34,7 +92,6 @@ fn jaro_similarity_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     let mut matches = 0usize;
     let mut transpositions = 0usize;
 
-    // Find matching characters
     for i in 0..len1 {
         let start = i.saturating_sub(match_distance);
         let end = min(i + match_distance + 1, len2);
@@ -54,18 +111,11 @@ fn jaro_similarity_ascii(s1: &[u8], s2: &[u8]) -> f64 {
         return 0.0;
     }
 
-    // Count transpositions
     let mut k = 0;
     for i in 0..len1 {
-        if !s1_matches[i] {
-            continue;
-        }
-        while !s2_matches[k] {
-            k += 1;
-        }
-        if s1[i] != s2[k] {
-            transpositions += 1;
-        }
+        if !s1_matches[i] { continue; }
+        while !s2_matches[k] { k += 1; }
+        if s1[i] != s2[k] { transpositions += 1; }
         k += 1;
     }
 
@@ -75,18 +125,28 @@ fn jaro_similarity_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
 }
 
+/// Calculate Jaro similarity for ASCII strings
+#[inline(always)]
+fn jaro_similarity_ascii(s1: &[u8], s2: &[u8]) -> f64 {
+    let len1 = s1.len();
+    let len2 = s2.len();
+    
+    // Use bit-parallel for short strings
+    if len1 <= 64 && len2 <= 64 {
+        return jaro_bitparallel_ascii(s1, s2);
+    }
+    
+    jaro_standard_ascii(s1, s2)
+}
+
 /// Calculate Jaro similarity for Unicode strings
 #[inline(always)]
 fn jaro_similarity_chars(s1_chars: &[char], s2_chars: &[char]) -> f64 {
     let len1 = s1_chars.len();
     let len2 = s2_chars.len();
 
-    if len1 == 0 && len2 == 0 {
-        return 1.0;
-    }
-    if len1 == 0 || len2 == 0 {
-        return 0.0;
-    }
+    if len1 == 0 && len2 == 0 { return 1.0; }
+    if len1 == 0 || len2 == 0 { return 0.0; }
 
     let match_distance = max(len1, len2) / 2;
     let match_distance = if match_distance > 0 { match_distance - 1 } else { 0 };
@@ -117,15 +177,9 @@ fn jaro_similarity_chars(s1_chars: &[char], s2_chars: &[char]) -> f64 {
 
     let mut k = 0;
     for i in 0..len1 {
-        if !s1_matches[i] {
-            continue;
-        }
-        while !s2_matches[k] {
-            k += 1;
-        }
-        if s1_chars[i] != s2_chars[k] {
-            transpositions += 1;
-        }
+        if !s1_matches[i] { continue; }
+        while !s2_matches[k] { k += 1; }
+        if s1_chars[i] != s2_chars[k] { transpositions += 1; }
         k += 1;
     }
 
@@ -140,10 +194,10 @@ fn jaro_similarity_chars(s1_chars: &[char], s2_chars: &[char]) -> f64 {
 fn jaro_similarity_internal(s1: &str, s2: &str) -> f64 {
     // Fast path for identical strings
     if s1 == s2 {
-        return if s1.is_empty() && s2.is_empty() { 1.0 } else if s1.is_empty() { 0.0 } else { 1.0 };
+        return if s1.is_empty() { 1.0 } else { 1.0 };
     }
 
-    // ASCII fast path
+    // ASCII fast path with bit-parallel
     if s1.is_ascii() && s2.is_ascii() {
         return jaro_similarity_ascii(s1.as_bytes(), s2.as_bytes());
     }
@@ -242,5 +296,13 @@ mod tests {
     fn test_jaro_empty() {
         assert!((jaro_similarity_internal("", "") - 1.0).abs() < 0.001);
         assert!((jaro_similarity_internal("abc", "") - 0.0).abs() < 0.001);
+    }
+    
+    #[test]
+    fn test_jaro_bitparallel() {
+        // Test bit-parallel gives same result as standard
+        let sim1 = jaro_bitparallel_ascii(b"MARTHA", b"MARHTA");
+        let sim2 = jaro_standard_ascii(b"MARTHA", b"MARHTA");
+        assert!((sim1 - sim2).abs() < 0.001);
     }
 }

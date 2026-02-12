@@ -1,61 +1,95 @@
-//! OSA - Optimal String Alignment distance
+//! OSA - Optimal String Alignment distance with Hyyrö's bit-parallel algorithm
 //!
-//! Similar to Damerau-Levenshtein but with restriction that 
-//! each substring can only be edited once.
+//! Uses bit-parallel algorithm from:
+//! Hyyrö (2003) - "A Bit-Vector Algorithm for Computing Levenshtein and 
+//! Damerau Edit Distances"
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use std::cmp::min;
+use smallvec::SmallVec;
 
-/// Calculate OSA distance.
+/// Bit-parallel OSA for ASCII strings <= 64 chars (Hyyrö 2003)
 #[inline(always)]
-fn osa_internal(s1: &str, s2: &str) -> usize {
-    let s1_chars: Vec<char> = s1.chars().collect();
-    let s2_chars: Vec<char> = s2.chars().collect();
+fn osa_bitparallel_ascii(s1: &[u8], s2: &[u8]) -> usize {
+    let len1 = s1.len();
+    let len2 = s2.len();
+    
+    if len1 == 0 { return len2; }
+    if len2 == 0 { return len1; }
+    
+    // Build character block map
+    let mut block = [0u64; 256];
+    for (i, &c) in s1.iter().enumerate() {
+        block[c as usize] |= 1u64 << i;
+    }
+    
+    // Initialize bit vectors
+    let mut vp: u64 = (1u64 << len1) - 1;  // All 1s
+    let mut vn: u64 = 0;
+    let mut d0: u64 = 0;
+    let mut pm_j_old: u64 = 0;
+    let mut curr_dist = len1;
+    let mask = 1u64 << (len1 - 1);
+    
+    for &c2 in s2.iter() {
+        let pm_j = block[c2 as usize];
+        
+        // Step 1: Computing D0 with transposition
+        let tr = (((!d0) & pm_j) << 1) & pm_j_old;
+        d0 = (((pm_j & vp).wrapping_add(vp)) ^ vp) | pm_j | vn;
+        d0 |= tr;
+        
+        // Step 2: Computing HP and HN
+        let hp = vn | !(d0 | vp);
+        let hn = d0 & vp;
+        
+        // Step 3: Computing the value D[m,j]
+        if (hp & mask) != 0 {
+            curr_dist += 1;
+        }
+        if (hn & mask) != 0 {
+            curr_dist -= 1;
+        }
+        
+        // Step 4: Computing VP and VN
+        let hp_shifted = (hp << 1) | 1;
+        let hn_shifted = hn << 1;
+        vp = hn_shifted | !(d0 | hp_shifted);
+        vn = hp_shifted & d0;
+        pm_j_old = pm_j;
+    }
+    
+    curr_dist
+}
 
+/// Standard DP OSA (fallback for >64 chars or Unicode)
+#[inline(always)]
+fn osa_dp(s1_chars: &[char], s2_chars: &[char]) -> usize {
     let len1 = s1_chars.len();
     let len2 = s2_chars.len();
 
-    if len1 == 0 {
-        return len2;
-    }
-    if len2 == 0 {
-        return len1;
-    }
-    if s1 == s2 {
-        return 0;
-    }
+    if len1 == 0 { return len2; }
+    if len2 == 0 { return len1; }
 
     // Need 3 rows for transposition check
-    let mut d0: Vec<usize> = (0..=len2).collect();
-    let mut d1: Vec<usize> = vec![0; len2 + 1];
-    let mut d2: Vec<usize> = vec![0; len2 + 1];
+    let mut d0: SmallVec<[usize; 128]> = (0..=len2).collect();
+    let mut d1: SmallVec<[usize; 128]> = SmallVec::from_elem(0, len2 + 1);
+    let mut d2: SmallVec<[usize; 128]> = SmallVec::from_elem(0, len2 + 1);
 
     for i in 1..=len1 {
         d1[0] = i;
 
         for j in 1..=len2 {
-            let cost = if s1_chars[i - 1] == s2_chars[j - 1] {
-                0
-            } else {
-                1
-            };
+            let cost = if s1_chars[i - 1] == s2_chars[j - 1] { 0 } else { 1 };
 
-            d1[j] = min(
-                min(
-                    d0[j] + 1,     // deletion
-                    d1[j - 1] + 1, // insertion
-                ),
-                d0[j - 1] + cost, // substitution
-            );
+            d1[j] = (d0[j] + 1).min(d1[j - 1] + 1).min(d0[j - 1] + cost);
 
             // Check for transposition
-            if i > 1
-                && j > 1
+            if i > 1 && j > 1
                 && s1_chars[i - 1] == s2_chars[j - 2]
                 && s1_chars[i - 2] == s2_chars[j - 1]
             {
-                d1[j] = min(d1[j], d2[j - 2] + cost);
+                d1[j] = d1[j].min(d2[j - 2] + cost);
             }
         }
 
@@ -65,6 +99,27 @@ fn osa_internal(s1: &str, s2: &str) -> usize {
     }
 
     d0[len2]
+}
+
+/// Main OSA distance implementation
+#[inline(always)]
+fn osa_internal(s1: &str, s2: &str) -> usize {
+    if s1 == s2 { return 0; }
+    
+    // ASCII + short strings: use bit-parallel
+    if s1.is_ascii() && s2.is_ascii() {
+        let b1 = s1.as_bytes();
+        let b2 = s2.as_bytes();
+        
+        if b1.len() <= 64 {
+            return osa_bitparallel_ascii(b1, b2);
+        }
+    }
+    
+    // Unicode/long string path
+    let s1_chars: SmallVec<[char; 64]> = s1.chars().collect();
+    let s2_chars: SmallVec<[char; 64]> = s2.chars().collect();
+    osa_dp(&s1_chars, &s2_chars)
 }
 
 /// Calculate OSA distance.
@@ -83,7 +138,9 @@ pub fn osa_distance(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usize {
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn osa_similarity(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usize {
-    let max_len = s1.chars().count().max(s2.chars().count());
+    let len1 = if s1.is_ascii() { s1.len() } else { s1.chars().count() };
+    let len2 = if s2.is_ascii() { s2.len() } else { s2.chars().count() };
+    let max_len = len1.max(len2);
     let dist = osa_internal(s1, s2);
     let sim = max_len.saturating_sub(dist);
 
@@ -97,13 +154,11 @@ pub fn osa_similarity(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usize 
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn osa_normalized_distance(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
-    let m = s1.chars().count();
-    let n = s2.chars().count();
-    let max_len = m.max(n);
+    let len1 = if s1.is_ascii() { s1.len() } else { s1.chars().count() };
+    let len2 = if s2.is_ascii() { s2.len() } else { s2.chars().count() };
+    let max_len = len1.max(len2);
 
-    if max_len == 0 {
-        return 0.0;
-    }
+    if max_len == 0 { return 0.0; }
 
     let dist = osa_internal(s1, s2);
     let norm_dist = dist as f64 / max_len as f64;
@@ -135,10 +190,7 @@ pub fn osa_distance_batch(
     pairs: Vec<(String, String)>,
     score_cutoff: Option<usize>,
 ) -> Vec<usize> {
-    pairs
-        .par_iter()
-        .map(|(s1, s2)| osa_distance(s1, s2, score_cutoff))
-        .collect()
+    pairs.par_iter().map(|(s1, s2)| osa_distance(s1, s2, score_cutoff)).collect()
 }
 
 #[pyfunction]
@@ -147,10 +199,7 @@ pub fn osa_normalized_similarity_batch(
     pairs: Vec<(String, String)>,
     score_cutoff: Option<f64>,
 ) -> Vec<f64> {
-    pairs
-        .par_iter()
-        .map(|(s1, s2)| osa_normalized_similarity(s1, s2, score_cutoff))
-        .collect()
+    pairs.par_iter().map(|(s1, s2)| osa_normalized_similarity(s1, s2, score_cutoff)).collect()
 }
 
 #[cfg(test)]
@@ -158,8 +207,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_osa() {
-        assert_eq!(osa_internal("ab", "ba"), 1); // transposition
+    fn test_osa_bitparallel() {
+        assert_eq!(osa_bitparallel_ascii(b"ab", b"ba"), 1); // transposition
+        assert_eq!(osa_bitparallel_ascii(b"abc", b"abc"), 0);
+        assert_eq!(osa_bitparallel_ascii(b"CA", b"AC"), 2);
+    }
+    
+    #[test]
+    fn test_osa_internal() {
+        assert_eq!(osa_internal("ab", "ba"), 1);
         assert_eq!(osa_internal("abc", "abc"), 0);
     }
 }

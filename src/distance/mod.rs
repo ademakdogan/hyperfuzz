@@ -11,6 +11,7 @@ pub mod jaro;
 mod jaro_winkler;
 mod indel;
 mod lcs_seq;
+mod lcs_str;
 mod osa;
 mod prefix;
 mod postfix;
@@ -73,6 +74,14 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lcs_seq::lcs_seq_normalized_similarity, m)?)?;
     m.add_function(wrap_pyfunction!(lcs_seq::lcs_seq_distance_batch, m)?)?;
     m.add_function(wrap_pyfunction!(lcs_seq::lcs_seq_normalized_similarity_batch, m)?)?;
+
+    // LCSstr (Longest Common Substring)
+    m.add_function(wrap_pyfunction!(lcs_str::lcs_str_similarity, m)?)?;
+    m.add_function(wrap_pyfunction!(lcs_str::lcs_str_distance, m)?)?;
+    m.add_function(wrap_pyfunction!(lcs_str::lcs_str_normalized_similarity, m)?)?;
+    m.add_function(wrap_pyfunction!(lcs_str::lcs_str_normalized_distance, m)?)?;
+    m.add_function(wrap_pyfunction!(lcs_str::lcs_str_similarity_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(lcs_str::lcs_str_normalized_similarity_batch, m)?)?;
 
     // OSA
     m.add_function(wrap_pyfunction!(osa::osa_distance, m)?)?;

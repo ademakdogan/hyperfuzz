@@ -75,31 +75,110 @@ fn jaro_bitparallel_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
 }
 
-/// Standard Jaro for ASCII (fallback for >64 chars)
+/// 128-bit (2×u64) bit-parallel Jaro with RapidFuzz-style pattern matching
+/// Uses bit-vectors for O(1) character matching instead of O(k) linear search
 #[inline(always)]
-fn jaro_standard_ascii(s1: &[u8], s2: &[u8]) -> f64 {
+fn jaro_bitparallel_128(s1: &[u8], s2: &[u8]) -> f64 {
     let len1 = s1.len();
     let len2 = s2.len();
 
     if len1 == 0 && len2 == 0 { return 1.0; }
     if len1 == 0 || len2 == 0 { return 0.0; }
 
+    // Match distance (Jaro bound)
+    let bound = max(len1, len2) / 2;
+    let bound = if bound > 0 { bound - 1 } else { 0 };
+
+    // Build pattern match vector for s1 (character → bit positions)
+    // PM[char] = bit mask of positions where char appears in s1
+    let mut pm: [u128; 256] = [0u128; 256];
+    for (i, &c) in s1.iter().enumerate() {
+        pm[c as usize] |= 1u128 << i;
+    }
+
+    // Flagged matches
+    let mut p_flag: u128 = 0;  // Which positions in s1 are matched
+    let mut t_flag: u128 = 0;  // Which positions in s2 are matched
+    
+    // Sliding bound mask - starts covering positions [0, bound+1)
+    // and slides right as we process s2
+    let initial_bound_size = min(bound + 1, len1);
+    let mut bound_mask: u128 = (1u128 << initial_bound_size) - 1;
+    
+    // Process s2 and find matching chars in s1
+    for (j, &c2) in s2.iter().enumerate() {
+        // Get positions in s1 where c2 appears, within current bound window
+        let pm_j = pm[c2 as usize] & bound_mask & (!p_flag);
+        
+        if pm_j != 0 {
+            // Extract lowest set bit (first available match)
+            let match_bit = pm_j & pm_j.wrapping_neg();
+            p_flag |= match_bit;
+            t_flag |= 1u128 << j;
+        }
+        
+        // Slide the bound mask for next position
+        if j < bound {
+            // Still in the initial expansion phase
+            bound_mask = (bound_mask << 1) | 1;
+        } else {
+            // Normal sliding
+            bound_mask <<= 1;
+        }
+    }
+    
+    let common_chars = p_flag.count_ones() as usize;
+    if common_chars == 0 { return 0.0; }
+
+    // Count transpositions
+    let mut transpositions = 0usize;
+    let mut k = 0usize;
+    for i in 0..len1 {
+        if (p_flag >> i) & 1 == 0 { continue; }
+        while (t_flag >> k) & 1 == 0 { k += 1; }
+        if s1[i] != s2[k] { transpositions += 1; }
+        k += 1;
+    }
+
+    let m = common_chars as f64;
+    let t = (transpositions / 2) as f64;
+
+    (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
+}
+
+/// Standard Jaro for ASCII with bounds trimming (no char indexing - simpler and faster for ~100 char strings)
+#[inline(always)]
+fn jaro_standard_ascii(s1: &[u8], s2: &[u8]) -> f64 {
+    let orig_len1 = s1.len();
+    let orig_len2 = s2.len();
+
+    if orig_len1 == 0 && orig_len2 == 0 { return 1.0; }
+    if orig_len1 == 0 || orig_len2 == 0 { return 0.0; }
+
+    // RapidFuzz bounds trimming: skip unreachable characters
+    let (s1, s2, len1, len2) = if orig_len1 <= orig_len2 {
+        let bound = if orig_len2 > 1 { orig_len2 / 2 - 1 } else { 0 };
+        let max_text_len = min(orig_len2, orig_len1 + bound);
+        (&s1[..], &s2[..max_text_len], orig_len1, max_text_len)
+    } else {
+        let bound = if orig_len1 > 1 { orig_len1 / 2 - 1 } else { 0 };
+        let max_text_len = min(orig_len1, orig_len2 + bound);
+        (&s1[..max_text_len], &s2[..], max_text_len, orig_len2)
+    };
+
     let match_distance = max(len1, len2) / 2;
     let match_distance = if match_distance > 0 { match_distance - 1 } else { 0 };
 
-    let mut s1_matches: BoolVec = SmallVec::from_elem(false, len1);
-    let mut s2_matches: BoolVec = SmallVec::from_elem(false, len2);
+    let mut s1_matches: SmallVec<[bool; 128]> = SmallVec::from_elem(false, len1);
+    let mut s2_matches: SmallVec<[bool; 128]> = SmallVec::from_elem(false, len2);
     let mut matches = 0usize;
-    let mut transpositions = 0usize;
 
     for i in 0..len1 {
         let start = i.saturating_sub(match_distance);
         let end = min(i + match_distance + 1, len2);
 
         for j in start..end {
-            if s2_matches[j] || s1[i] != s2[j] {
-                continue;
-            }
+            if s2_matches[j] || s1[i] != s2[j] { continue; }
             s1_matches[i] = true;
             s2_matches[j] = true;
             matches += 1;
@@ -107,10 +186,10 @@ fn jaro_standard_ascii(s1: &[u8], s2: &[u8]) -> f64 {
         }
     }
 
-    if matches == 0 {
-        return 0.0;
-    }
+    if matches == 0 { return 0.0; }
 
+    // Count transpositions
+    let mut transpositions = 0usize;
     let mut k = 0;
     for i in 0..len1 {
         if !s1_matches[i] { continue; }
@@ -122,7 +201,7 @@ fn jaro_standard_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     let m = matches as f64;
     let t = (transpositions / 2) as f64;
 
-    (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
+    (m / orig_len1 as f64 + m / orig_len2 as f64 + (m - t) / m) / 3.0
 }
 
 /// Calculate Jaro similarity for ASCII strings
@@ -131,11 +210,17 @@ fn jaro_similarity_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     let len1 = s1.len();
     let len2 = s2.len();
     
-    // Use bit-parallel for short strings
+    // Use bit-parallel for short strings (<= 64 chars)
     if len1 <= 64 && len2 <= 64 {
         return jaro_bitparallel_ascii(s1, s2);
     }
     
+    // Use 128-bit bit-parallel for medium strings (65-128 chars)
+    if len1 <= 128 && len2 <= 128 {
+        return jaro_bitparallel_128(s1, s2);
+    }
+    
+    // Standard algorithm with optimizations for very long strings
     jaro_standard_ascii(s1, s2)
 }
 

@@ -62,7 +62,61 @@ fn osa_bitparallel_ascii(s1: &[u8], s2: &[u8]) -> usize {
     curr_dist
 }
 
-/// Standard DP OSA (fallback for >64 chars or Unicode)
+/// 128-bit bit-parallel OSA for strings 65-128 chars using u128
+#[inline(always)]
+fn osa_bitparallel_128(s1: &[u8], s2: &[u8]) -> usize {
+    let len1 = s1.len();
+    let len2 = s2.len();
+    
+    if len1 == 0 { return len2; }
+    if len2 == 0 { return len1; }
+    
+    // Build character block map using u128
+    let mut block: [u128; 256] = [0u128; 256];
+    for (i, &c) in s1.iter().enumerate() {
+        block[c as usize] |= 1u128 << i;
+    }
+    
+    // Initialize bit vectors
+    let mut vp: u128 = (1u128 << len1) - 1;  // All 1s up to len1
+    let mut vn: u128 = 0;
+    let mut d0: u128 = 0;
+    let mut pm_j_old: u128 = 0;
+    let mut curr_dist = len1;
+    let mask: u128 = 1u128 << (len1 - 1);
+    
+    for &c2 in s2.iter() {
+        let pm_j = block[c2 as usize];
+        
+        // Step 1: Computing D0 with transposition
+        let tr = (((!d0) & pm_j) << 1) & pm_j_old;
+        d0 = (((pm_j & vp).wrapping_add(vp)) ^ vp) | pm_j | vn;
+        d0 |= tr;
+        
+        // Step 2: Computing HP and HN
+        let hp = vn | !(d0 | vp);
+        let hn = d0 & vp;
+        
+        // Step 3: Computing the value D[m,j]
+        if (hp & mask) != 0 {
+            curr_dist += 1;
+        }
+        if (hn & mask) != 0 {
+            curr_dist -= 1;
+        }
+        
+        // Step 4: Computing VP and VN
+        let hp_shifted = (hp << 1) | 1;
+        let hn_shifted = hn << 1;
+        vp = hn_shifted | !(d0 | hp_shifted);
+        vn = hp_shifted & d0;
+        pm_j_old = pm_j;
+    }
+    
+    curr_dist
+}
+
+/// Standard DP OSA (fallback for >128 chars or Unicode)
 #[inline(always)]
 fn osa_dp(s1_chars: &[char], s2_chars: &[char]) -> usize {
     let len1 = s1_chars.len();
@@ -106,17 +160,23 @@ fn osa_dp(s1_chars: &[char], s2_chars: &[char]) -> usize {
 fn osa_internal(s1: &str, s2: &str) -> usize {
     if s1 == s2 { return 0; }
     
-    // ASCII + short strings: use bit-parallel
+    // ASCII path with bit-parallel
     if s1.is_ascii() && s2.is_ascii() {
         let b1 = s1.as_bytes();
         let b2 = s2.as_bytes();
         
+        // Ensure b1 is the shorter string for bit-parallel (RapidFuzz technique)
+        let (b1, b2) = if b1.len() <= b2.len() { (b1, b2) } else { (b2, b1) };
+        
         if b1.len() <= 64 {
             return osa_bitparallel_ascii(b1, b2);
         }
+        if b1.len() <= 128 {
+            return osa_bitparallel_128(b1, b2);
+        }
     }
     
-    // Unicode/long string path
+    // Unicode/very long string path
     let s1_chars: SmallVec<[char; 64]> = s1.chars().collect();
     let s2_chars: SmallVec<[char; 64]> = s2.chars().collect();
     osa_dp(&s1_chars, &s2_chars)

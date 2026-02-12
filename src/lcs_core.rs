@@ -50,6 +50,112 @@ pub fn lcs_bitparallel_ascii(s1: &[u8], s2: &[u8]) -> usize {
     len1 - (s & mask).count_ones() as usize
 }
 
+/// Multi-block bit-parallel LCS for strings > 64 characters
+/// Uses multiple 64-bit words to handle longer strings
+#[inline(always)]
+pub fn lcs_bitparallel_multiblock(s1: &[u8], s2: &[u8]) -> usize {
+    let len1 = s1.len();
+    let len2 = s2.len();
+    
+    if len1 == 0 || len2 == 0 { return 0; }
+    if len1 <= 64 { return lcs_bitparallel_ascii(s1, s2); }
+    
+    // Use specialized 2-block version for 65-128 chars (stack allocated)
+    if len1 <= 128 {
+        return lcs_bitparallel_2block(s1, s2);
+    }
+    
+    // General multi-block for > 128 chars
+    let num_blocks = (len1 + 63) / 64;
+    let mut block_maps: Vec<[u64; 256]> = vec![[0u64; 256]; num_blocks];
+    
+    for (i, &c) in s1.iter().enumerate() {
+        let block_idx = i / 64;
+        let bit_pos = i % 64;
+        block_maps[block_idx][c as usize] |= 1u64 << bit_pos;
+    }
+    
+    let mut s_vec: Vec<u64> = vec![!0u64; num_blocks];
+    
+    for &c2 in s2.iter() {
+        let mut carry: u64 = 0;
+        
+        for block_idx in 0..num_blocks {
+            let matches = block_maps[block_idx][c2 as usize];
+            let s_old = s_vec[block_idx];
+            
+            let u = s_old & matches;
+            let (sum, overflow1) = s_old.overflowing_add(u);
+            let sum_with_carry = sum.wrapping_add(carry);
+            let overflow2 = sum_with_carry < sum;
+            
+            s_vec[block_idx] = sum_with_carry | (s_old.wrapping_sub(u));
+            carry = (overflow1 || overflow2) as u64;
+        }
+    }
+    
+    let mut lcs = 0usize;
+    for (block_idx, &s) in s_vec.iter().enumerate() {
+        let block_start = block_idx * 64;
+        let block_len = std::cmp::min(64, len1 - block_start);
+        let mask = if block_len == 64 { !0u64 } else { (1u64 << block_len) - 1 };
+        lcs += block_len - (s & mask).count_ones() as usize;
+    }
+    
+    lcs
+}
+
+/// Specialized 2-block LCS for strings 65-128 chars (full stack allocation)
+#[inline(always)]
+fn lcs_bitparallel_2block(s1: &[u8], s2: &[u8]) -> usize {
+    let len1 = s1.len();
+    
+    // Stack-allocated block maps (2 blocks × 256 entries)
+    let mut block0: [u64; 256] = [0u64; 256];
+    let mut block1: [u64; 256] = [0u64; 256];
+    
+    for (i, &c) in s1.iter().enumerate() {
+        if i < 64 {
+            block0[c as usize] |= 1u64 << i;
+        } else {
+            block1[c as usize] |= 1u64 << (i - 64);
+        }
+    }
+    
+    // Stack-allocated state (2 × u64)
+    let mut s0: u64 = !0u64;
+    let mut s1_state: u64 = !0u64;
+    
+    for &c2 in s2.iter() {
+        let matches0 = block0[c2 as usize];
+        let matches1 = block1[c2 as usize];
+        
+        // Block 0
+        let u0 = s0 & matches0;
+        let (sum0, overflow0) = s0.overflowing_add(u0);
+        s0 = sum0 | (s0.wrapping_sub(u0));
+        let carry = overflow0 as u64;
+        
+        // Block 1
+        let u1 = s1_state & matches1;
+        let (sum1, _) = s1_state.overflowing_add(u1);
+        let sum1_carry = sum1.wrapping_add(carry);
+        s1_state = sum1_carry | (s1_state.wrapping_sub(u1));
+    }
+    
+    // Count LCS
+    let len_block0 = std::cmp::min(64, len1);
+    let len_block1 = len1 - 64;
+    
+    let mask0 = !0u64; // full 64 bits
+    let mask1 = if len_block1 == 64 { !0u64 } else { (1u64 << len_block1) - 1 };
+    
+    let lcs0 = 64 - (s0 & mask0).count_ones() as usize;
+    let lcs1 = len_block1 - (s1_state & mask1).count_ones() as usize;
+    
+    lcs0 + lcs1
+}
+
 /// Compute LCS using pre-built block map (for sliding window operations)
 #[inline(always)]
 pub fn lcs_with_block(block: &[u64; 256], len1: usize, s2: &[u8]) -> usize {
@@ -254,23 +360,117 @@ pub fn lcs_chars_optimized(s1: &[char], s2: &[char]) -> usize {
     prev[m]
 }
 
-/// Main entry point - uses bit-parallel for short ASCII strings
+/// Main entry point - uses bit-parallel for all ASCII strings
 #[inline(always)]
 pub fn lcs_fast(s1: &str, s2: &str) -> usize {
     if s1.is_ascii() && s2.is_ascii() {
         let b1 = s1.as_bytes();
         let b2 = s2.as_bytes();
         
-        // Use bit-parallel for strings <= 64 chars
-        if b1.len() <= 64 {
-            return lcs_bitparallel_ascii(b1, b2);
-        }
-        return lcs_dp_optimized(b1, b2);
+        // Use bit-parallel for all ASCII strings (multi-block handles > 64)
+        return lcs_bitparallel_multiblock(b1, b2);
     }
     
     let c1: SmallVec<[char; 64]> = s1.chars().collect();
     let c2: SmallVec<[char; 64]> = s2.chars().collect();
     lcs_chars_optimized(&c1, &c2)
+}
+
+// ============ Longest Common Substring (LCSstr) ============
+// Unlike LCSseq, this finds contiguous common substrings
+
+/// Compute longest common substring length for ASCII strings
+/// Uses suffix-based DP approach with O(min(m,n)) space
+#[inline(always)]
+pub fn lcsstr_ascii(s1: &[u8], s2: &[u8]) -> usize {
+    let m = s1.len();
+    let n = s2.len();
+    
+    if m == 0 || n == 0 {
+        return 0;
+    }
+    
+    // Ensure s1 is the shorter string for space optimization
+    let (short, long) = if m <= n { (s1, s2) } else { (s2, s1) };
+    let short_len = short.len();
+    let long_len = long.len();
+    
+    // Single row DP - dp[j] = length of common substring ending at positions (i, j)
+    let mut prev = vec![0usize; short_len + 1];
+    let mut curr = vec![0usize; short_len + 1];
+    let mut max_len = 0;
+    
+    for i in 1..=long_len {
+        for j in 1..=short_len {
+            if long[i - 1] == short[j - 1] {
+                curr[j] = prev[j - 1] + 1;
+                if curr[j] > max_len {
+                    max_len = curr[j];
+                }
+            } else {
+                curr[j] = 0;
+            }
+        }
+        std::mem::swap(&mut prev, &mut curr);
+        curr.fill(0);
+    }
+    
+    max_len
+}
+
+/// Compute longest common substring length for Unicode strings
+#[inline(always)]
+pub fn lcsstr_chars(s1: &[char], s2: &[char]) -> usize {
+    let m = s1.len();
+    let n = s2.len();
+    
+    if m == 0 || n == 0 {
+        return 0;
+    }
+    
+    // Ensure s1 is the shorter string
+    let (short, long) = if m <= n { (s1, s2) } else { (s2, s1) };
+    let short_len = short.len();
+    let long_len = long.len();
+    
+    let mut prev = vec![0usize; short_len + 1];
+    let mut curr = vec![0usize; short_len + 1];
+    let mut max_len = 0;
+    
+    for i in 1..=long_len {
+        for j in 1..=short_len {
+            if long[i - 1] == short[j - 1] {
+                curr[j] = prev[j - 1] + 1;
+                if curr[j] > max_len {
+                    max_len = curr[j];
+                }
+            } else {
+                curr[j] = 0;
+            }
+        }
+        std::mem::swap(&mut prev, &mut curr);
+        curr.fill(0);
+    }
+    
+    max_len
+}
+
+/// Main entry point for LCSstr - uses optimized path for ASCII
+#[inline(always)]
+pub fn lcsstr_fast(s1: &str, s2: &str) -> usize {
+    if s1.is_empty() || s2.is_empty() {
+        return 0;
+    }
+    
+    // Fast path for ASCII
+    if s1.is_ascii() && s2.is_ascii() {
+        return lcsstr_ascii(s1.as_bytes(), s2.as_bytes());
+    }
+    
+    // Unicode path
+    let c1: SmallVec<[char; 64]> = s1.chars().collect();
+    let c2: SmallVec<[char; 64]> = s2.chars().collect();
+    lcsstr_chars(&c1, &c2)
 }
 
 /// Calculate ratio from LCS

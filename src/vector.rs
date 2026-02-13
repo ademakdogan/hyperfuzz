@@ -1,15 +1,20 @@
 //! Vector and statistical similarity methods
 //!
 //! Provides:
-//! - Cosine Similarity (N-gram based)
+//! - Cosine Similarity (word-based by default, optionally n-gram based)
 //! - Soft-TFIDF (TF-IDF with fuzzy token matching)
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use ahash::AHashMap;
-use std::collections::HashMap;
 
-// ============ N-gram generation ============
+// ============ Tokenization ============
+
+/// Tokenize string into words (whitespace-separated)
+#[inline(always)]
+fn tokenize_words(s: &str) -> Vec<String> {
+    s.split_whitespace().map(|w| w.to_string()).collect()
+}
 
 /// Generate character n-grams from a string.
 #[inline(always)]
@@ -26,39 +31,24 @@ fn generate_ngrams(s: &str, n: usize) -> Vec<String> {
 
 /// Build term frequency vector.
 #[inline(always)]
-fn build_tf_vector(ngrams: &[String]) -> AHashMap<String, f64> {
+fn build_tf_vector(tokens: &[String]) -> AHashMap<String, f64> {
     let mut tf: AHashMap<String, f64> = AHashMap::new();
-    for ngram in ngrams {
-        *tf.entry(ngram.clone()).or_insert(0.0) += 1.0;
+    for token in tokens {
+        *tf.entry(token.clone()).or_insert(0.0) += 1.0;
     }
     tf
 }
 
 // ============ Cosine Similarity ============
 
-/// Calculate cosine similarity between two strings using n-grams.
-#[pyfunction]
-#[pyo3(signature = (s1, s2, *, n=2, score_cutoff=None))]
-pub fn cosine_similarity(s1: &str, s2: &str, n: usize, score_cutoff: Option<f64>) -> f64 {
-    let ngrams1 = generate_ngrams(s1, n);
-    let ngrams2 = generate_ngrams(s2, n);
-    
-    if ngrams1.is_empty() && ngrams2.is_empty() {
-        return 1.0;
-    }
-    if ngrams1.is_empty() || ngrams2.is_empty() {
-        return 0.0;
-    }
-    
-    let tf1 = build_tf_vector(&ngrams1);
-    let tf2 = build_tf_vector(&ngrams2);
-    
-    // Calculate dot product and magnitudes
+/// Calculate cosine similarity between two TF vectors.
+#[inline(always)]
+fn cosine_similarity_from_vectors(tf1: &AHashMap<String, f64>, tf2: &AHashMap<String, f64>) -> f64 {
     let mut dot_product = 0.0;
     let mut mag1 = 0.0;
     let mut mag2 = 0.0;
     
-    for (key, val1) in &tf1 {
+    for (key, val1) in tf1 {
         mag1 += val1 * val1;
         if let Some(val2) = tf2.get(key) {
             dot_product += val1 * val2;
@@ -71,11 +61,48 @@ pub fn cosine_similarity(s1: &str, s2: &str, n: usize, score_cutoff: Option<f64>
     
     let magnitude = (mag1.sqrt()) * (mag2.sqrt());
     
-    let result = if magnitude == 0.0 {
+    if magnitude == 0.0 {
         0.0
     } else {
         dot_product / magnitude
-    };
+    }
+}
+
+/// Calculate cosine similarity between two strings.
+/// 
+/// When use_words=true (default): Uses word-based tokenization (TextDistance compatible)
+/// When use_words=false: Uses character n-grams
+#[pyfunction]
+#[pyo3(signature = (s1, s2, *, use_words=true, ngram_size=2, score_cutoff=None))]
+pub fn cosine_similarity(
+    s1: &str, 
+    s2: &str, 
+    use_words: bool,
+    ngram_size: usize, 
+    score_cutoff: Option<f64>
+) -> f64 {
+    let tokens1: Vec<String>;
+    let tokens2: Vec<String>;
+    
+    if use_words {
+        tokens1 = tokenize_words(s1);
+        tokens2 = tokenize_words(s2);
+    } else {
+        tokens1 = generate_ngrams(s1, ngram_size);
+        tokens2 = generate_ngrams(s2, ngram_size);
+    }
+    
+    if tokens1.is_empty() && tokens2.is_empty() {
+        return 1.0;
+    }
+    if tokens1.is_empty() || tokens2.is_empty() {
+        return 0.0;
+    }
+    
+    let tf1 = build_tf_vector(&tokens1);
+    let tf2 = build_tf_vector(&tokens2);
+    
+    let result = cosine_similarity_from_vectors(&tf1, &tf2);
     
     match score_cutoff {
         Some(cutoff) if result < cutoff => 0.0,
@@ -85,9 +112,15 @@ pub fn cosine_similarity(s1: &str, s2: &str, n: usize, score_cutoff: Option<f64>
 
 /// Calculate cosine distance (1 - similarity).
 #[pyfunction]
-#[pyo3(signature = (s1, s2, *, n=2, score_cutoff=None))]
-pub fn cosine_distance(s1: &str, s2: &str, n: usize, score_cutoff: Option<f64>) -> f64 {
-    let sim = cosine_similarity(s1, s2, n, None);
+#[pyo3(signature = (s1, s2, *, use_words=true, ngram_size=2, score_cutoff=None))]
+pub fn cosine_distance(
+    s1: &str, 
+    s2: &str, 
+    use_words: bool,
+    ngram_size: usize, 
+    score_cutoff: Option<f64>
+) -> f64 {
+    let sim = cosine_similarity(s1, s2, use_words, ngram_size, None);
     let dist = 1.0 - sim;
     
     match score_cutoff {
@@ -97,11 +130,16 @@ pub fn cosine_distance(s1: &str, s2: &str, n: usize, score_cutoff: Option<f64>) 
 }
 
 #[pyfunction]
-#[pyo3(signature = (pairs, *, n=2, score_cutoff=None))]
-pub fn cosine_similarity_batch(pairs: Vec<(String, String)>, n: usize, score_cutoff: Option<f64>) -> Vec<f64> {
+#[pyo3(signature = (pairs, *, use_words=true, ngram_size=2, score_cutoff=None))]
+pub fn cosine_similarity_batch(
+    pairs: Vec<(String, String)>, 
+    use_words: bool,
+    ngram_size: usize, 
+    score_cutoff: Option<f64>
+) -> Vec<f64> {
     pairs
         .par_iter()
-        .map(|(s1, s2)| cosine_similarity(s1, s2, n, score_cutoff))
+        .map(|(s1, s2)| cosine_similarity(s1, s2, use_words, ngram_size, score_cutoff))
         .collect()
 }
 
@@ -281,8 +319,13 @@ mod tests {
 
     #[test]
     fn test_cosine() {
-        let sim = cosine_similarity("hello", "hello", 2, None);
+        // Test with n-grams (use_words=false)
+        let sim = cosine_similarity("hello", "hello", false, 2, None);
         assert!((sim - 1.0).abs() < 0.01);
+        
+        // Test with words (use_words=true)
+        let sim_words = cosine_similarity("hello world", "hello world", true, 2, None);
+        assert!((sim_words - 1.0).abs() < 0.01);
     }
 
     #[test]

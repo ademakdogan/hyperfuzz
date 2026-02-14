@@ -36,6 +36,21 @@ from hyperfuzz._hyperfuzz import (
     soft_tfidf_similarity_batch,
 )
 
+# Re-export distance module functions at top level
+lcs_seq_distance = distance.lcs_seq_distance
+lcs_seq_similarity = distance.lcs_seq_similarity
+lcs_seq_normalized_distance = distance.lcs_seq_normalized_distance
+lcs_seq_normalized_similarity = distance.lcs_seq_normalized_similarity
+lcs_seq_distance_batch = distance.lcs_seq_distance_batch
+lcs_seq_normalized_similarity_batch = distance.lcs_seq_normalized_similarity_batch
+
+lcs_str_similarity = distance.lcs_str_similarity
+lcs_str_distance = distance.lcs_str_distance
+lcs_str_normalized_similarity = distance.lcs_str_normalized_similarity
+lcs_str_normalized_distance = distance.lcs_str_normalized_distance
+lcs_str_similarity_batch = distance.lcs_str_similarity_batch
+lcs_str_normalized_similarity_batch = distance.lcs_str_normalized_similarity_batch
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -69,4 +84,18 @@ __all__ = [
     "soft_tfidf_similarity",
     "soft_tfidf_distance",
     "soft_tfidf_similarity_batch",
+    # LCSseq
+    "lcs_seq_distance",
+    "lcs_seq_similarity",
+    "lcs_seq_normalized_distance",
+    "lcs_seq_normalized_similarity",
+    "lcs_seq_distance_batch",
+    "lcs_seq_normalized_similarity_batch",
+    # LCSstr
+    "lcs_str_similarity",
+    "lcs_str_distance",
+    "lcs_str_normalized_similarity",
+    "lcs_str_normalized_distance",
+    "lcs_str_similarity_batch",
+    "lcs_str_normalized_similarity_batch",
 ]

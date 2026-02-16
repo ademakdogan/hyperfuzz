@@ -1,38 +1,74 @@
 //! Set-based similarity algorithms
 //!
-//! Provides token/word set similarity metrics:
+//! Provides token/word similarity metrics using multiset (bag) semantics:
 //! - Jaccard Similarity
 //! - Sørensen-Dice Coefficient
 //! - Tversky Index
 //! - Overlap Coefficient
+//!
+//! TextDistance compatible: uses Counter (multiset) not Set
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use ahash::AHashSet;
+use ahash::AHashMap;
 
-/// Tokenize a string into words.
+/// Tokenize a string into word counts (multiset/bag of words).
 #[inline(always)]
-fn tokenize(s: &str) -> AHashSet<&str> {
-    s.split_whitespace().collect()
+fn tokenize_counter(s: &str) -> AHashMap<&str, usize> {
+    let mut counter: AHashMap<&str, usize> = AHashMap::new();
+    for word in s.split_whitespace() {
+        *counter.entry(word).or_insert(0) += 1;
+    }
+    counter
+}
+
+/// Calculate intersection count (minimum of each element's count)
+#[inline(always)]
+fn intersection_count(c1: &AHashMap<&str, usize>, c2: &AHashMap<&str, usize>) -> usize {
+    let mut count = 0;
+    for (key, &val1) in c1 {
+        if let Some(&val2) = c2.get(key) {
+            count += val1.min(val2);
+        }
+    }
+    count
+}
+
+/// Calculate union count (maximum of each element's count)
+#[inline(always)]
+fn union_count(c1: &AHashMap<&str, usize>, c2: &AHashMap<&str, usize>) -> usize {
+    let mut merged = c1.clone();
+    for (key, &val2) in c2 {
+        merged.entry(key)
+            .and_modify(|v| *v = (*v).max(val2))
+            .or_insert(val2);
+    }
+    merged.values().sum()
+}
+
+/// Calculate total count of all elements
+#[inline(always)]
+fn total_count(c: &AHashMap<&str, usize>) -> usize {
+    c.values().sum()
 }
 
 // ============ Jaccard Similarity ============
-// |A ∩ B| / |A ∪ B|
+// |A ∩ B| / |A ∪ B| using multiset semantics
 
 /// Calculate Jaccard similarity between two strings.
-/// Based on word/token sets.
+/// Uses multiset (Counter) semantics for TextDistance compatibility.
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn jaccard_similarity(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
-    let set1 = tokenize(s1);
-    let set2 = tokenize(s2);
+    let counter1 = tokenize_counter(s1);
+    let counter2 = tokenize_counter(s2);
     
-    if set1.is_empty() && set2.is_empty() {
+    if counter1.is_empty() && counter2.is_empty() {
         return 1.0;
     }
     
-    let intersection = set1.intersection(&set2).count();
-    let union = set1.union(&set2).count();
+    let intersection = intersection_count(&counter1, &counter2);
+    let union = union_count(&counter1, &counter2);
     
     let result = if union == 0 {
         0.0
@@ -75,15 +111,15 @@ pub fn jaccard_similarity_batch(pairs: Vec<(String, String)>, score_cutoff: Opti
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn sorensen_dice_similarity(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
-    let set1 = tokenize(s1);
-    let set2 = tokenize(s2);
+    let counter1 = tokenize_counter(s1);
+    let counter2 = tokenize_counter(s2);
     
-    if set1.is_empty() && set2.is_empty() {
+    if counter1.is_empty() && counter2.is_empty() {
         return 1.0;
     }
     
-    let intersection = set1.intersection(&set2).count();
-    let total = set1.len() + set2.len();
+    let intersection = intersection_count(&counter1, &counter2);
+    let total = total_count(&counter1) + total_count(&counter2);
     
     let result = if total == 0 {
         0.0
@@ -136,16 +172,20 @@ pub fn tversky_similarity(
     beta: f64,
     score_cutoff: Option<f64>,
 ) -> f64 {
-    let set1 = tokenize(s1);
-    let set2 = tokenize(s2);
+    let counter1 = tokenize_counter(s1);
+    let counter2 = tokenize_counter(s2);
     
-    if set1.is_empty() && set2.is_empty() {
+    if counter1.is_empty() && counter2.is_empty() {
         return 1.0;
     }
     
-    let intersection = set1.intersection(&set2).count() as f64;
-    let diff1 = set1.difference(&set2).count() as f64;
-    let diff2 = set2.difference(&set1).count() as f64;
+    let intersection = intersection_count(&counter1, &counter2) as f64;
+    
+    // Calculate differences: |A - B| and |B - A|
+    let total1 = total_count(&counter1) as f64;
+    let total2 = total_count(&counter2) as f64;
+    let diff1 = total1 - intersection;  // |A - B|
+    let diff2 = total2 - intersection;  // |B - A|
     
     let denominator = intersection + alpha * diff1 + beta * diff2;
     
@@ -202,15 +242,15 @@ pub fn tversky_similarity_batch(
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn overlap_similarity(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
-    let set1 = tokenize(s1);
-    let set2 = tokenize(s2);
+    let counter1 = tokenize_counter(s1);
+    let counter2 = tokenize_counter(s2);
     
-    if set1.is_empty() && set2.is_empty() {
+    if counter1.is_empty() && counter2.is_empty() {
         return 1.0;
     }
     
-    let intersection = set1.intersection(&set2).count();
-    let min_size = set1.len().min(set2.len());
+    let intersection = intersection_count(&counter1, &counter2);
+    let min_size = total_count(&counter1).min(total_count(&counter2));
     
     let result = if min_size == 0 {
         0.0
@@ -255,6 +295,13 @@ mod tests {
         // "a b c" vs "b c d" -> intersection=2, union=4 -> 0.5
         let j = jaccard_similarity("a b c", "b c d", None);
         assert!((j - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_jaccard_with_duplicates() {
+        // "the the" vs "the the" -> intersection=2, union=2 -> 1.0
+        let j = jaccard_similarity("the the", "the the", None);
+        assert!((j - 1.0).abs() < 0.01);
     }
 
     #[test]

@@ -26,7 +26,8 @@ pub fn lcs_str_similarity(s1: &str, s2: &str, score_cutoff: Option<usize>) -> us
     }
 }
 
-/// LCS (substring) distance: len(s1) + len(s2) - 2 * LCSstr
+/// LCS (substring) distance: max(len1, len2) - LCSstr
+/// TextDistance formula: distance = maximum - similarity
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn lcs_str_distance(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usize {
@@ -35,7 +36,7 @@ pub fn lcs_str_distance(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usiz
     let len1 = str_len(s1);
     let len2 = str_len(s2);
     let lcs = lcsstr_fast(s1, s2);
-    let dist = len1 + len2 - 2 * lcs;
+    let dist = len1.max(len2) - lcs;
 
     match score_cutoff {
         Some(cutoff) if dist > cutoff => cutoff + 1,
@@ -43,7 +44,8 @@ pub fn lcs_str_distance(s1: &str, s2: &str, score_cutoff: Option<usize>) -> usiz
     }
 }
 
-/// Normalized LCS (substring) similarity: 2 * LCSstr / (len(s1) + len(s2))
+/// Normalized LCS (substring) similarity: LCSstr / max(len(s1), len(s2))
+/// TextDistance formula: similarity / maximum
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn lcs_str_normalized_similarity(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
@@ -51,12 +53,12 @@ pub fn lcs_str_normalized_similarity(s1: &str, s2: &str, score_cutoff: Option<f6
     
     let len1 = str_len(s1);
     let len2 = str_len(s2);
-    let total = len1 + len2;
+    let max_len = len1.max(len2);
     
-    if total == 0 { return 1.0; }
+    if max_len == 0 { return 1.0; }
     
     let lcs = lcsstr_fast(s1, s2);
-    let sim = (2.0 * lcs as f64) / total as f64;
+    let sim = (lcs as f64) / (max_len as f64);
     
     match score_cutoff {
         Some(cutoff) if sim < cutoff => 0.0,
@@ -64,7 +66,7 @@ pub fn lcs_str_normalized_similarity(s1: &str, s2: &str, score_cutoff: Option<f6
     }
 }
 
-/// Normalized LCS (substring) distance
+/// Normalized LCS (substring) distance: 1 - normalized_similarity
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn lcs_str_normalized_distance(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {

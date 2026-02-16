@@ -72,6 +72,8 @@ fn cosine_similarity_from_vectors(tf1: &AHashMap<String, f64>, tf2: &AHashMap<St
 /// 
 /// When use_words=true (default): Uses word-based tokenization (TextDistance compatible)
 /// When use_words=false: Uses character n-grams
+/// 
+/// TextDistance formula: intersection / sqrt(count1 * count2)
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, use_words=true, ngram_size=2, score_cutoff=None))]
 pub fn cosine_similarity(
@@ -81,6 +83,7 @@ pub fn cosine_similarity(
     ngram_size: usize, 
     score_cutoff: Option<f64>
 ) -> f64 {
+    // Tokenize
     let tokens1: Vec<String>;
     let tokens2: Vec<String>;
     
@@ -99,10 +102,30 @@ pub fn cosine_similarity(
         return 0.0;
     }
     
-    let tf1 = build_tf_vector(&tokens1);
-    let tf2 = build_tf_vector(&tokens2);
+    // Build counters (multiset)
+    let counter1 = build_tf_vector(&tokens1);
+    let counter2 = build_tf_vector(&tokens2);
     
-    let result = cosine_similarity_from_vectors(&tf1, &tf2);
+    // TextDistance formula: intersection / sqrt(count1 * count2)
+    // Intersection count = sum of min(count1[k], count2[k]) for common keys
+    let mut intersection = 0.0;
+    for (key, &val1) in &counter1 {
+        if let Some(&val2) = counter2.get(key) {
+            intersection += val1.min(val2);
+        }
+    }
+    
+    // Total counts
+    let count1: f64 = counter1.values().sum();
+    let count2: f64 = counter2.values().sum();
+    
+    let product = count1 * count2;
+    
+    let result = if product == 0.0 {
+        0.0
+    } else {
+        intersection / product.sqrt()
+    };
     
     match score_cutoff {
         Some(cutoff) if result < cutoff => 0.0,

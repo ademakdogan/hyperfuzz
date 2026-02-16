@@ -16,6 +16,7 @@ use rayon::prelude::*;
 /// 
 /// Finds the best local alignment between two strings.
 /// Default scoring: match=1, mismatch=0, gap_cost=1 (TextDistance compatible)
+/// NOTE: TextDistance returns the score at the last cell, not the max cell.
 #[inline(always)]
 fn smith_waterman_internal(s1: &str, s2: &str, match_score: f64, mismatch_score: f64, gap_cost: f64) -> f64 {
     let s1_chars: Vec<char> = s1.chars().collect();
@@ -29,7 +30,6 @@ fn smith_waterman_internal(s1: &str, s2: &str, match_score: f64, mismatch_score:
     }
 
     let mut matrix: Vec<Vec<f64>> = vec![vec![0.0; n + 1]; m + 1];
-    let mut max_score = 0.0;
 
     for i in 1..=m {
         for j in 1..=n {
@@ -43,15 +43,13 @@ fn smith_waterman_internal(s1: &str, s2: &str, match_score: f64, mismatch_score:
             let up = matrix[i - 1][j] - gap_cost;
             let left = matrix[i][j - 1] - gap_cost;
 
-            let score = diag.max(up).max(left).max(0.0);
-            matrix[i][j] = score;
-            if score > max_score {
-                max_score = score;
-            }
+            // Smith-Waterman: allow 0 as minimum
+            matrix[i][j] = diag.max(up).max(left).max(0.0);
         }
     }
 
-    max_score
+    // TextDistance returns the last cell, not the maximum
+    matrix[m][n]
 }
 
 /// Calculate Smith-Waterman similarity score.

@@ -39,6 +39,7 @@ fn partial_ratio_impl_ascii(shorter: &[u8], longer: &[u8]) -> f64 {
     let mut best_score = 0.0f64;
     
     // Phase 1: Prefix windows of longer string (size 1 to len1-1)
+    // RapidFuzz: for i in range(1, len1): window = s2[:i]
     for i in 1..len1 {
         if i > len2 { break; }
         let substr_last = longer[i - 1];
@@ -51,9 +52,11 @@ fn partial_ratio_impl_ascii(shorter: &[u8], longer: &[u8]) -> f64 {
         if best_score >= 100.0 { return 100.0; }
     }
     
-    // Phase 2: Full-size windows (sliding through middle)
-    if len2 >= len1 {
-        for i in 0..=(len2 - len1) {
+    // Phase 2: Full-size windows (only when longer > shorter)
+    // RapidFuzz: for i in range(len2 - len1): window = s2[i:i+len1]
+    // Note: range(0) is empty, so for equal length, this phase is skipped
+    if len2 > len1 {
+        for i in 0..(len2 - len1) {
             let substr_last = longer[i + len1 - 1];
             if !char_set[substr_last as usize] { continue; }
             
@@ -66,17 +69,18 @@ fn partial_ratio_impl_ascii(shorter: &[u8], longer: &[u8]) -> f64 {
     }
     
     // Phase 3: Suffix windows of longer string
-    if len2 > len1 {
-        for i in (len2 - len1 + 1)..len2 {
-            let substr_first = longer[i];
-            if !char_set[substr_first as usize] { continue; }
-            
-            let window = &longer[i..];
-            let lcs = lcs_with_block(&block, len1, window);
-            let score = ratio_from_lcs(len1, window.len(), lcs);
-            if score > best_score { best_score = score; }
-            if best_score >= 100.0 { return 100.0; }
-        }
+    // RapidFuzz: for i in range(len2 - len1, len2): window = s2[i:]
+    // For equal length: this checks [0:], [1:], [2:], ... [len2-1:]
+    let start_idx = if len2 > len1 { len2 - len1 } else { 0 };
+    for i in start_idx..len2 {
+        let substr_first = longer[i];
+        if !char_set[substr_first as usize] { continue; }
+        
+        let window = &longer[i..];
+        let lcs = lcs_with_block(&block, len1, window);
+        let score = ratio_from_lcs(len1, window.len(), lcs);
+        if score > best_score { best_score = score; }
+        if best_score >= 100.0 { return 100.0; }
     }
     
     best_score
@@ -255,9 +259,10 @@ fn partial_ratio_2block(shorter: &[u8], longer: &[u8]) -> f64 {
         if best >= 100.0 { return 100.0; }
     }
     
-    // Phase 2: Full windows
-    if long_len >= short_len {
-        for i in 0..=(long_len - short_len) {
+    // Phase 2: Full windows (only when longer > shorter)
+    // RapidFuzz: for i in range(len2 - len1): window = s2[i:i+len1]
+    if long_len > short_len {
+        for i in 0..(long_len - short_len) {
             let substr_last = longer[i + short_len - 1];
             if !char_set[substr_last as usize] { continue; }
             
@@ -270,17 +275,17 @@ fn partial_ratio_2block(shorter: &[u8], longer: &[u8]) -> f64 {
     }
     
     // Phase 3: Suffix windows
-    if long_len > short_len {
-        for i in (long_len - short_len + 1)..long_len {
-            let substr_first = longer[i];
-            if !char_set[substr_first as usize] { continue; }
-            
-            let window = &longer[i..];
-            let lcs = lcs_2block_window(&block0, &block1, short_len, len_block1, num_blocks, window);
-            let score = ratio_from_lcs(short_len, window.len(), lcs);
-            if score > best { best = score; }
-            if best >= 100.0 { return 100.0; }
-        }
+    // RapidFuzz: for i in range(len2 - len1, len2): window = s2[i:]
+    let start_idx = if long_len > short_len { long_len - short_len } else { 0 };
+    for i in start_idx..long_len {
+        let substr_first = longer[i];
+        if !char_set[substr_first as usize] { continue; }
+        
+        let window = &longer[i..];
+        let lcs = lcs_2block_window(&block0, &block1, short_len, len_block1, num_blocks, window);
+        let score = ratio_from_lcs(short_len, window.len(), lcs);
+        if score > best { best = score; }
+        if best >= 100.0 { return 100.0; }
     }
     
     best
@@ -392,9 +397,10 @@ fn partial_ratio_impl_unicode(shorter: &[char], longer: &[char]) -> f64 {
         if best >= 100.0 { return 100.0; }
     }
     
-    // Phase 2: Full windows
-    if long_len >= short_len {
-        for i in 0..=(long_len - short_len) {
+    // Phase 2: Full windows (only when longer > shorter)
+    // RapidFuzz: for i in range(len2 - len1): window = s2[i:i+len1]
+    if long_len > short_len {
+        for i in 0..(long_len - short_len) {
             let substr_last = longer[i + short_len - 1];
             if !char_set.contains(&substr_last) { continue; }
             
@@ -407,17 +413,17 @@ fn partial_ratio_impl_unicode(shorter: &[char], longer: &[char]) -> f64 {
     }
     
     // Phase 3: Suffix windows
-    if long_len > short_len {
-        for i in (long_len - short_len + 1)..long_len {
-            let substr_first = longer[i];
-            if !char_set.contains(&substr_first) { continue; }
-            
-            let window = &longer[i..];
-            let lcs = lcs_chars(shorter, window);
-            let score = ratio_from_lcs(short_len, window.len(), lcs);
-            if score > best { best = score; }
-            if best >= 100.0 { return 100.0; }
-        }
+    // RapidFuzz: for i in range(len2 - len1, len2): window = s2[i:]
+    let start_idx = if long_len > short_len { long_len - short_len } else { 0 };
+    for i in start_idx..long_len {
+        let substr_first = longer[i];
+        if !char_set.contains(&substr_first) { continue; }
+        
+        let window = &longer[i..];
+        let lcs = lcs_chars(shorter, window);
+        let score = ratio_from_lcs(short_len, window.len(), lcs);
+        if score > best { best = score; }
+        if best >= 100.0 { return 100.0; }
     }
     
     best

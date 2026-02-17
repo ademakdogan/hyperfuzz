@@ -33,3 +33,4 @@ htmlcov/
 
 # Cargo
 Cargo.lock
+rapidfuzz-rs-main/

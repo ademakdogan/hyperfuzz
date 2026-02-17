@@ -171,7 +171,7 @@ def main():
                     hf_score_str = f"{hf_score:.4f}"
                     rf_score_str = f"{rf_score:.4f}"
                 
-                print(f"{algo_name:<22} {match_icon:<6} {hf_score_str:<12} {rf_score_str:<12} {hf_time:<10.1f} {rf_time:<10.1f} {speedup:>5.2f}x {speed_icon}")
+                print(f"{algo_name:<22} {match_icon:<6} {hf_score_str:<12} {rf_score_str:<12} {hf_time:<10.3f} {rf_time:<10.3f} {speedup:>5.2f}x {speed_icon}")
                 
             except Exception as e:
                 print(f"{algo_name:<22} ⚠️  ERROR: {e}")

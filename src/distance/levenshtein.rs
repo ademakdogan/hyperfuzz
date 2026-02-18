@@ -7,14 +7,8 @@
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use smallvec::SmallVec;
-use std::cell::RefCell;
 
 use crate::lcs_core::simd_str_equal;
-
-// Thread-local buffer for DP fallback
-thread_local! {
-    static LEV_BUF: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(256));
-}
 
 /// Myers' bit-parallel Levenshtein for ASCII strings <= 64 chars
 /// O(n) for fixed pattern length, O(n*m/64) overall
@@ -68,12 +62,90 @@ fn levenshtein_myers_64(s1: &[u8], s2: &[u8]) -> usize {
     curr_dist
 }
 
-/// Block-based Myers for longer strings (>64 chars)
+/// Multi-block Myers bit-parallel for longer strings (>64 chars)
+/// Based on RapidFuzz's levenshtein_hyrroe2003_block algorithm
+/// O(n * m / 64) complexity
 #[inline(always)]
 fn levenshtein_myers_block(s1: &[u8], s2: &[u8]) -> usize {
-    // For now, fall back to DP for strings > 64 chars
-    // Full block implementation would be complex
-    levenshtein_dp(s1, s2)
+    let len1 = s1.len();
+    let len2 = s2.len();
+    
+    if len1 == 0 { return len2; }
+    if len2 == 0 { return len1; }
+    
+    // Ensure s1 is the shorter string for block map
+    let (s1, s2) = if len1 > len2 { (s2, s1) } else { (s1, s2) };
+    let len1 = s1.len();
+    let _len2 = s2.len();
+    
+    const WORD_SIZE: usize = 64;
+    let words = (len1 + WORD_SIZE - 1) / WORD_SIZE;
+    
+    // Build block pattern match vectors for s1
+    // blocks[word][char] = bitmask where char appears in that word of s1
+    let mut blocks: Vec<[u64; 256]> = vec![[0u64; 256]; words];
+    
+    for (i, &c) in s1.iter().enumerate() {
+        let word = i / WORD_SIZE;
+        let bit_pos = i % WORD_SIZE;
+        blocks[word][c as usize] |= 1u64 << bit_pos;
+    }
+    
+    // Initialize VP/VN vectors for each word
+    let mut vp: SmallVec<[u64; 8]> = smallvec::smallvec![!0u64; words];
+    let mut vn: SmallVec<[u64; 8]> = smallvec::smallvec![0u64; words];
+    
+    // Initial scores for each block
+    let mut scores: SmallVec<[usize; 8]> = (0..words)
+        .map(|i| if i < words - 1 { (i + 1) * WORD_SIZE } else { len1 })
+        .collect();
+    
+    // Last bit mask for final word
+    let last_bit = 1u64 << ((len1 - 1) % WORD_SIZE);
+    
+    // Process each character of s2
+    for &c2 in s2.iter() {
+        let mut hp_carry: u64 = 1;
+        let mut hn_carry: u64 = 0;
+        
+        for word in 0..words {
+            // Step 1: Computing D0
+            let pm_j = blocks[word][c2 as usize];
+            let old_vp = vp[word];
+            let old_vn = vn[word];
+            
+            let x = pm_j | hn_carry;
+            let d0 = (((x & old_vp).wrapping_add(old_vp)) ^ old_vp) | x | old_vn;
+            
+            // Step 2: Computing HP and HN
+            let hp = old_vn | !(d0 | old_vp);
+            let hn = d0 & old_vp;
+            
+            // Compute carry for next block
+            let hp_carry_temp = hp_carry;
+            let hn_carry_temp = hn_carry;
+            
+            if word < words - 1 {
+                hp_carry = hp >> 63;
+                hn_carry = hn >> 63;
+            } else {
+                hp_carry = if (hp & last_bit) != 0 { 1 } else { 0 };
+                hn_carry = if (hn & last_bit) != 0 { 1 } else { 0 };
+            }
+            
+            // Step 3: Update score
+            scores[word] = (scores[word] as isize + (hp_carry as isize) - (hn_carry as isize)) as usize;
+            
+            // Step 4: Computing VP and VN
+            let hp_shifted = (hp << 1) | hp_carry_temp;
+            let hn_shifted = (hn << 1) | hn_carry_temp;
+            
+            vp[word] = hn_shifted | !(d0 | hp_shifted);
+            vn[word] = hp_shifted & d0;
+        }
+    }
+    
+    scores[words - 1]
 }
 
 /// Optimized DP with prefix/suffix elimination
@@ -112,48 +184,13 @@ fn levenshtein_dp(s1: &[u8], s2: &[u8]) -> usize {
     if m == 0 { return n; }
     if n == 0 { return m; }
     
-    // Use short strings with Myers
+    // Use Myers bit-parallel for all sizes
     if m <= 64 {
         return levenshtein_myers_64(s1, s2);
     }
-
-    // DP fallback
-    LEV_BUF.with(|buf| {
-        let mut row = buf.borrow_mut();
-        row.clear();
-        row.extend(0..=m);
-        
-        for c2 in s2.iter() {
-            let mut prev_diag = row[0];
-            row[0] += 1;
-            
-            // Unrolled loop
-            let mut i = 0;
-            while i + 4 <= m {
-                let old0 = row[i + 1];
-                let old1 = row[i + 2];
-                let old2 = row[i + 3];
-                let old3 = row[i + 4];
-                
-                row[i + 1] = if s1[i] == *c2 { prev_diag } else { prev_diag.min(row[i + 1]).min(row[i]) + 1 };
-                row[i + 2] = if s1[i + 1] == *c2 { old0 } else { old0.min(row[i + 2]).min(row[i + 1]) + 1 };
-                row[i + 3] = if s1[i + 2] == *c2 { old1 } else { old1.min(row[i + 3]).min(row[i + 2]) + 1 };
-                row[i + 4] = if s1[i + 3] == *c2 { old2 } else { old2.min(row[i + 4]).min(row[i + 3]) + 1 };
-                
-                prev_diag = old3;
-                i += 4;
-            }
-            
-            while i < m {
-                let old_diag = row[i + 1];
-                row[i + 1] = if s1[i] == *c2 { prev_diag } else { prev_diag.min(row[i + 1]).min(row[i]) + 1 };
-                prev_diag = old_diag;
-                i += 1;
-            }
-        }
-        
-        row[m]
-    })
+    
+    // Use multi-block Myers for longer strings
+    levenshtein_myers_block(s1, s2)
 }
 
 /// Levenshtein for Unicode
@@ -194,7 +231,22 @@ fn levenshtein_unicode(s1: &str, s2: &str) -> usize {
 
     if m == 0 { return n; }
     if n == 0 { return m; }
+    
+    // Check if all chars fit in Latin-1 (0-255) for fast bit-parallel path
+    let all_latin1 = s1.iter().chain(s2.iter()).all(|&c| c as u32 <= 255);
+    
+    if all_latin1 {
+        // Convert to bytes and use fast bit-parallel
+        let s1_bytes: SmallVec<[u8; 256]> = s1.iter().map(|&c| c as u8).collect();
+        let s2_bytes: SmallVec<[u8; 256]> = s2.iter().map(|&c| c as u8).collect();
+        
+        if m <= 64 {
+            return levenshtein_myers_64(&s1_bytes, &s2_bytes);
+        }
+        return levenshtein_myers_block(&s1_bytes, &s2_bytes);
+    }
 
+    // Full Unicode DP fallback
     let mut row: SmallVec<[usize; 128]> = (0..=m).collect();
     
     for c2 in s2.iter() {

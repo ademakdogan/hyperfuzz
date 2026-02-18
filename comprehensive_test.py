@@ -50,6 +50,14 @@ TEST_PAIRS = [
     
     # 10. Unicode strings (accents)
     ("café résumé", "cafe resume"),
+    
+    # 11. High token count - sentence comparison (15+ tokens)
+    ("The artificial intelligence system processes natural language understanding tasks efficiently using advanced neural networks",
+     "The machine learning system handles natural language processing tasks effectively using modern neural architectures"),
+    
+    # 12. Very high token count - paragraph comparison (20+ tokens)
+    ("In the modern era of software development teams around the world are constantly seeking new innovative solutions to complex programming challenges that require deep technical expertise",
+     "In the current age of software engineering groups across the globe are always looking for new creative approaches to difficult coding problems that demand strong technical knowledge"),
 ]
 
 # Algorithms to test

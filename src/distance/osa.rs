@@ -116,6 +116,108 @@ fn osa_bitparallel_128(s1: &[u8], s2: &[u8]) -> usize {
     curr_dist
 }
 
+/// Multi-block bit-parallel OSA for strings >128 chars
+/// Based on RapidFuzz's osa_hyrroe2003_block algorithm
+#[inline(always)]
+fn osa_bitparallel_block(s1: &[u8], s2: &[u8]) -> usize {
+    let len1 = s1.len();
+    let len2 = s2.len();
+    
+    if len1 == 0 { return len2; }
+    if len2 == 0 { return len1; }
+    
+    // Ensure s1 is the shorter string
+    let (s1, s2) = if len1 > len2 { (s2, s1) } else { (s1, s2) };
+    let len1 = s1.len();
+    let _len2 = s2.len();
+    
+    const WORD_SIZE: usize = 64;
+    let words = (len1 + WORD_SIZE - 1) / WORD_SIZE;
+    
+    // Build block pattern match vectors
+    let mut blocks: Vec<[u64; 256]> = vec![[0u64; 256]; words];
+    for (i, &c) in s1.iter().enumerate() {
+        let word = i / WORD_SIZE;
+        let bit_pos = i % WORD_SIZE;
+        blocks[word][c as usize] |= 1u64 << bit_pos;
+    }
+    
+    // Row state for each word
+    #[derive(Clone, Copy)]
+    struct Row {
+        vp: u64,
+        vn: u64,
+        d0: u64,
+        pm: u64,
+    }
+    
+    impl Default for Row {
+        fn default() -> Self {
+            Row { vp: !0u64, vn: 0, d0: 0, pm: 0 }
+        }
+    }
+    
+    let mut old_rows: SmallVec<[Row; 8]> = smallvec::smallvec![Row::default(); words + 1];
+    let mut new_rows: SmallVec<[Row; 8]> = smallvec::smallvec![Row::default(); words + 1];
+    
+    let last_bit = 1u64 << ((len1 - 1) % WORD_SIZE);
+    let mut curr_dist = len1;
+    
+    for &c2 in s2.iter() {
+        let mut hp_carry: u64 = 1;
+        let mut hn_carry: u64 = 0;
+        
+        for word in 0..words {
+            // Retrieve bit vectors from last iteration
+            let vp = old_rows[word + 1].vp;
+            let vn = old_rows[word + 1].vn;
+            let d0_old = old_rows[word + 1].d0;
+            let d0_last = old_rows[word].d0;
+            
+            // PM of last char same word
+            let pm_j_old = old_rows[word + 1].pm;
+            // PM of last word
+            let pm_last = new_rows[word].pm;
+            
+            let pm_j = blocks[word][c2 as usize];
+            let x = pm_j | hn_carry;
+            
+            // Transposition check across blocks
+            let tr = ((((!d0_old) & pm_j) << 1) | (((!d0_last) & pm_last) >> 63)) & pm_j_old;
+            
+            let mut d0 = (((x & vp).wrapping_add(vp)) ^ vp) | x | vn;
+            d0 |= tr;
+            
+            let hp = vn | !(d0 | vp);
+            let hn = d0 & vp;
+            
+            // Update distance for last word
+            if word == words - 1 {
+                if (hp & last_bit) != 0 { curr_dist += 1; }
+                if (hn & last_bit) != 0 { curr_dist -= 1; }
+            }
+            
+            // Compute carry
+            let hp_carry_temp = hp_carry;
+            hp_carry = hp >> 63;
+            let hn_carry_temp = hn_carry;
+            hn_carry = hn >> 63;
+            
+            let hp_shifted = (hp << 1) | hp_carry_temp;
+            let hn_shifted = (hn << 1) | hn_carry_temp;
+            
+            new_rows[word + 1].vp = hn_shifted | !(d0 | hp_shifted);
+            new_rows[word + 1].vn = hp_shifted & d0;
+            new_rows[word + 1].d0 = d0;
+            new_rows[word + 1].pm = pm_j;
+        }
+        
+        std::mem::swap(&mut old_rows, &mut new_rows);
+    }
+    
+    curr_dist
+}
+
 /// Standard DP OSA (fallback for >128 chars or Unicode)
 #[inline(always)]
 fn osa_dp(s1_chars: &[char], s2_chars: &[char]) -> usize {
@@ -165,7 +267,7 @@ fn osa_internal(s1: &str, s2: &str) -> usize {
         let b1 = s1.as_bytes();
         let b2 = s2.as_bytes();
         
-        // Ensure b1 is the shorter string for bit-parallel (RapidFuzz technique)
+        // Ensure b1 is the shorter string for bit-parallel
         let (b1, b2) = if b1.len() <= b2.len() { (b1, b2) } else { (b2, b1) };
         
         if b1.len() <= 64 {
@@ -174,11 +276,37 @@ fn osa_internal(s1: &str, s2: &str) -> usize {
         if b1.len() <= 128 {
             return osa_bitparallel_128(b1, b2);
         }
+        // Use multi-block for >128 chars
+        return osa_bitparallel_block(b1, b2);
     }
     
-    // Unicode/very long string path
+    // Unicode path - check for Latin-1
     let s1_chars: SmallVec<[char; 64]> = s1.chars().collect();
     let s2_chars: SmallVec<[char; 64]> = s2.chars().collect();
+    
+    // Check if all chars fit in Latin-1 (0-255)
+    let all_latin1 = s1_chars.iter().chain(s2_chars.iter()).all(|&c| c as u32 <= 255);
+    
+    if all_latin1 {
+        let s1_bytes: SmallVec<[u8; 256]> = s1_chars.iter().map(|&c| c as u8).collect();
+        let s2_bytes: SmallVec<[u8; 256]> = s2_chars.iter().map(|&c| c as u8).collect();
+        
+        let (b1, b2) = if s1_bytes.len() <= s2_bytes.len() {
+            (&s1_bytes[..], &s2_bytes[..])
+        } else {
+            (&s2_bytes[..], &s1_bytes[..])
+        };
+        
+        if b1.len() <= 64 {
+            return osa_bitparallel_ascii(b1, b2);
+        }
+        if b1.len() <= 128 {
+            return osa_bitparallel_128(b1, b2);
+        }
+        return osa_bitparallel_block(b1, b2);
+    }
+    
+    // Full Unicode DP fallback
     osa_dp(&s1_chars, &s2_chars)
 }
 

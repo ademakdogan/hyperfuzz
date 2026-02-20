@@ -145,9 +145,8 @@ fn jaro_bitparallel_128(s1: &[u8], s2: &[u8]) -> f64 {
 
     (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
 }
-
 /// Multi-block bit-parallel Jaro for ASCII strings >128 chars
-/// Uses multiple 64-bit blocks for pattern matching
+/// Uses RapidFuzz-style sliding bound mask for O(n) character flagging
 #[inline(always)]
 fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     let orig_len1 = s1.len();
@@ -156,16 +155,15 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     if orig_len1 == 0 && orig_len2 == 0 { return 1.0; }
     if orig_len1 == 0 || orig_len2 == 0 { return 0.0; }
 
-    // Ensure s1 <= s2 for efficiency
+    // Ensure s1 <= s2 for efficiency (pattern = shorter string)
     let (s1, s2, len1, len2) = if orig_len1 <= orig_len2 {
         (s1, s2, orig_len1, orig_len2)
     } else {
         (s2, s1, orig_len2, orig_len1)
     };
     
-    // Jaro match distance
-    let bound = len2 / 2;
-    let bound = if bound > 0 { bound - 1 } else { 0 };
+    // Jaro match distance (bound)
+    let bound = if len2 > 1 { len2 / 2 - 1 } else { 0 };
     
     // Trim s2 to only include reachable characters
     let max_s2_len = min(len2, len1 + bound);
@@ -176,7 +174,7 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     let p_words = (len1 + WORD_SIZE - 1) / WORD_SIZE;
     let t_words = (len2_trimmed + WORD_SIZE - 1) / WORD_SIZE;
     
-    // Build pattern match vectors for s1 (one per 64-char block)
+    // Build pattern match vectors for s1 (BlockPatternMatchVector equivalent)
     let mut pm: Vec<[u64; 256]> = vec![[0u64; 256]; p_words];
     for (i, &c) in s1.iter().enumerate() {
         let word = i / WORD_SIZE;
@@ -188,61 +186,87 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     let mut p_flag: SmallVec<[u64; 8]> = smallvec::smallvec![0u64; p_words];
     let mut t_flag: SmallVec<[u64; 8]> = smallvec::smallvec![0u64; t_words];
     
-    // Process each character in s2
+    // Sliding bound mask state (RapidFuzz SearchBoundMask equivalent)
+    let start_range = min(bound + 1, len1);
+    let mut empty_words = 0usize;
+    let mut active_words = 1 + start_range / WORD_SIZE;
+    let mut first_mask: u64 = !0u64;
+    let mut last_mask: u64 = if start_range % WORD_SIZE == 0 { !0u64 } else { (1u64 << (start_range % WORD_SIZE)) - 1 };
+    
+    // Process each character in s2 with sliding window
     for (j, &c2) in s2.iter().enumerate() {
         let t_word = j / WORD_SIZE;
         let t_bit = j % WORD_SIZE;
         
-        // Calculate which words of s1 are in range for this position
-        let start_pos = j.saturating_sub(bound);
-        let end_pos = min(j + bound + 1, len1);
+        // Try to find match in active words
+        let mut found = false;
         
-        if start_pos >= end_pos { continue; }
+        // First word (may be partially masked)
+        if active_words >= 1 && !found {
+            let word = empty_words;
+            if word < p_words {
+                let mask = if active_words == 1 { first_mask & last_mask } else { first_mask };
+                let pm_j = pm[word][c2 as usize] & mask & !p_flag[word];
+                if pm_j != 0 {
+                    p_flag[word] |= pm_j & pm_j.wrapping_neg();
+                    t_flag[t_word] |= 1u64 << t_bit;
+                    found = true;
+                }
+            }
+        }
         
-        let start_word = start_pos / WORD_SIZE;
-        let end_word = (end_pos - 1) / WORD_SIZE;
+        // Middle words (fully active)
+        if !found && active_words > 2 {
+            for word in (empty_words + 1)..(empty_words + active_words - 1) {
+                if word >= p_words { break; }
+                let pm_j = pm[word][c2 as usize] & !p_flag[word];
+                if pm_j != 0 {
+                    p_flag[word] |= pm_j & pm_j.wrapping_neg();
+                    t_flag[t_word] |= 1u64 << t_bit;
+                    found = true;
+                    break;
+                }
+            }
+        }
         
-        // Try to find a match in each word
-        for word in start_word..=end_word {
-            if word >= p_words { break; }
-            
-            // Create mask for valid positions in this word
-            let word_start = word * WORD_SIZE;
-            let word_end = min((word + 1) * WORD_SIZE, len1);
-            
-            let range_start = max(start_pos, word_start);
-            let range_end = min(end_pos, word_end);
-            
-            if range_start >= range_end { continue; }
-            
-            let local_start = range_start - word_start;
-            let local_end = range_end - word_start;
-            
-            // Mask for valid bit positions
-            let range_mask = if local_end >= 64 {
-                !0u64 << local_start
-            } else {
-                (!0u64 >> (64 - local_end)) & (!0u64 << local_start)
-            };
-            
-            // Get matching positions, excluding already matched
-            let pm_j = pm[word][c2 as usize] & range_mask & !p_flag[word];
-            
-            if pm_j != 0 {
-                // Found a match - take lowest bit
-                let match_bit = pm_j & pm_j.wrapping_neg();
-                p_flag[word] |= match_bit;
-                t_flag[t_word] |= 1u64 << t_bit;
-                break;
+        // Last word (may be partially masked)
+        if !found && active_words >= 2 {
+            let word = empty_words + active_words - 1;
+            if word < p_words {
+                let pm_j = pm[word][c2 as usize] & last_mask & !p_flag[word];
+                if pm_j != 0 {
+                    p_flag[word] |= pm_j & pm_j.wrapping_neg();
+                    t_flag[t_word] |= 1u64 << t_bit;
+                }
+            }
+        }
+        
+        // Update sliding bound mask
+        if j + bound + 1 < len1 {
+            // Expand last_mask
+            last_mask = (last_mask << 1) | 1;
+            if j + bound + 2 < len1 && last_mask == !0u64 {
+                last_mask = 0;
+                active_words += 1;
+            }
+        }
+        
+        if j >= bound {
+            // Shrink first_mask
+            first_mask <<= 1;
+            if first_mask == 0 {
+                first_mask = !0u64;
+                active_words = active_words.saturating_sub(1);
+                empty_words += 1;
             }
         }
     }
     
-    // Count common characters
+    // Count common characters using popcount
     let common_chars: usize = p_flag.iter().map(|w| w.count_ones() as usize).sum();
     if common_chars == 0 { return 0.0; }
     
-    // Count transpositions
+    // Count transpositions using bit scanning
     let mut transpositions = 0usize;
     let mut p_word = 0usize;
     let mut p_mask = p_flag[0];
@@ -269,7 +293,7 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
                 transpositions += 1;
             }
             
-            p_mask &= p_mask - 1; // Clear lowest bit
+            p_mask &= p_mask - 1; // blsr - clear lowest bit
             t_mask &= t_mask - 1;
         }
     }

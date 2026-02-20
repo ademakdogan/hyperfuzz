@@ -146,59 +146,135 @@ fn jaro_bitparallel_128(s1: &[u8], s2: &[u8]) -> f64 {
     (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
 }
 
-/// Standard Jaro for ASCII with bounds trimming (no char indexing - simpler and faster for ~100 char strings)
+/// Multi-block bit-parallel Jaro for ASCII strings >128 chars
+/// Uses multiple 64-bit blocks for pattern matching
 #[inline(always)]
-fn jaro_standard_ascii(s1: &[u8], s2: &[u8]) -> f64 {
+fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     let orig_len1 = s1.len();
     let orig_len2 = s2.len();
 
     if orig_len1 == 0 && orig_len2 == 0 { return 1.0; }
     if orig_len1 == 0 || orig_len2 == 0 { return 0.0; }
 
-    // RapidFuzz bounds trimming: skip unreachable characters
+    // Ensure s1 <= s2 for efficiency
     let (s1, s2, len1, len2) = if orig_len1 <= orig_len2 {
-        let bound = if orig_len2 > 1 { orig_len2 / 2 - 1 } else { 0 };
-        let max_text_len = min(orig_len2, orig_len1 + bound);
-        (&s1[..], &s2[..max_text_len], orig_len1, max_text_len)
+        (s1, s2, orig_len1, orig_len2)
     } else {
-        let bound = if orig_len1 > 1 { orig_len1 / 2 - 1 } else { 0 };
-        let max_text_len = min(orig_len1, orig_len2 + bound);
-        (&s1[..max_text_len], &s2[..], max_text_len, orig_len2)
+        (s2, s1, orig_len2, orig_len1)
     };
-
-    let match_distance = max(len1, len2) / 2;
-    let match_distance = if match_distance > 0 { match_distance - 1 } else { 0 };
-
-    let mut s1_matches: SmallVec<[bool; 128]> = SmallVec::from_elem(false, len1);
-    let mut s2_matches: SmallVec<[bool; 128]> = SmallVec::from_elem(false, len2);
-    let mut matches = 0usize;
-
-    for i in 0..len1 {
-        let start = i.saturating_sub(match_distance);
-        let end = min(i + match_distance + 1, len2);
-
-        for j in start..end {
-            if s2_matches[j] || s1[i] != s2[j] { continue; }
-            s1_matches[i] = true;
-            s2_matches[j] = true;
-            matches += 1;
-            break;
+    
+    // Jaro match distance
+    let bound = len2 / 2;
+    let bound = if bound > 0 { bound - 1 } else { 0 };
+    
+    // Trim s2 to only include reachable characters
+    let max_s2_len = min(len2, len1 + bound);
+    let s2 = &s2[..max_s2_len];
+    let len2_trimmed = s2.len();
+    
+    const WORD_SIZE: usize = 64;
+    let p_words = (len1 + WORD_SIZE - 1) / WORD_SIZE;
+    let t_words = (len2_trimmed + WORD_SIZE - 1) / WORD_SIZE;
+    
+    // Build pattern match vectors for s1 (one per 64-char block)
+    let mut pm: Vec<[u64; 256]> = vec![[0u64; 256]; p_words];
+    for (i, &c) in s1.iter().enumerate() {
+        let word = i / WORD_SIZE;
+        let bit = i % WORD_SIZE;
+        pm[word][c as usize] |= 1u64 << bit;
+    }
+    
+    // Flag vectors
+    let mut p_flag: SmallVec<[u64; 8]> = smallvec::smallvec![0u64; p_words];
+    let mut t_flag: SmallVec<[u64; 8]> = smallvec::smallvec![0u64; t_words];
+    
+    // Process each character in s2
+    for (j, &c2) in s2.iter().enumerate() {
+        let t_word = j / WORD_SIZE;
+        let t_bit = j % WORD_SIZE;
+        
+        // Calculate which words of s1 are in range for this position
+        let start_pos = j.saturating_sub(bound);
+        let end_pos = min(j + bound + 1, len1);
+        
+        if start_pos >= end_pos { continue; }
+        
+        let start_word = start_pos / WORD_SIZE;
+        let end_word = (end_pos - 1) / WORD_SIZE;
+        
+        // Try to find a match in each word
+        for word in start_word..=end_word {
+            if word >= p_words { break; }
+            
+            // Create mask for valid positions in this word
+            let word_start = word * WORD_SIZE;
+            let word_end = min((word + 1) * WORD_SIZE, len1);
+            
+            let range_start = max(start_pos, word_start);
+            let range_end = min(end_pos, word_end);
+            
+            if range_start >= range_end { continue; }
+            
+            let local_start = range_start - word_start;
+            let local_end = range_end - word_start;
+            
+            // Mask for valid bit positions
+            let range_mask = if local_end >= 64 {
+                !0u64 << local_start
+            } else {
+                (!0u64 >> (64 - local_end)) & (!0u64 << local_start)
+            };
+            
+            // Get matching positions, excluding already matched
+            let pm_j = pm[word][c2 as usize] & range_mask & !p_flag[word];
+            
+            if pm_j != 0 {
+                // Found a match - take lowest bit
+                let match_bit = pm_j & pm_j.wrapping_neg();
+                p_flag[word] |= match_bit;
+                t_flag[t_word] |= 1u64 << t_bit;
+                break;
+            }
+        }
+    }
+    
+    // Count common characters
+    let common_chars: usize = p_flag.iter().map(|w| w.count_ones() as usize).sum();
+    if common_chars == 0 { return 0.0; }
+    
+    // Count transpositions
+    let mut transpositions = 0usize;
+    let mut p_word = 0usize;
+    let mut p_mask = p_flag[0];
+    
+    for t_word in 0..t_words {
+        let mut t_mask = t_flag[t_word];
+        while t_mask != 0 {
+            let t_bit = t_mask.trailing_zeros() as usize;
+            let t_pos = t_word * WORD_SIZE + t_bit;
+            
+            // Find next matched position in s1
+            while p_mask == 0 {
+                p_word += 1;
+                if p_word >= p_words { break; }
+                p_mask = p_flag[p_word];
+            }
+            
+            if p_word >= p_words { break; }
+            
+            let p_bit = p_mask.trailing_zeros() as usize;
+            let p_pos = p_word * WORD_SIZE + p_bit;
+            
+            if s1[p_pos] != s2[t_pos] {
+                transpositions += 1;
+            }
+            
+            p_mask &= p_mask - 1; // Clear lowest bit
+            t_mask &= t_mask - 1;
         }
     }
 
-    if matches == 0 { return 0.0; }
-
-    // Count transpositions
-    let mut transpositions = 0usize;
-    let mut k = 0;
-    for i in 0..len1 {
-        if !s1_matches[i] { continue; }
-        while !s2_matches[k] { k += 1; }
-        if s1[i] != s2[k] { transpositions += 1; }
-        k += 1;
-    }
-
-    let m = matches as f64;
+    let m = common_chars as f64;
     let t = (transpositions / 2) as f64;
 
     (m / orig_len1 as f64 + m / orig_len2 as f64 + (m - t) / m) / 3.0
@@ -221,7 +297,7 @@ fn jaro_similarity_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     }
     
     // Standard algorithm with optimizations for very long strings
-    jaro_standard_ascii(s1, s2)
+    jaro_multiblock_ascii(s1, s2)
 }
 
 /// Calculate Jaro similarity for Unicode strings
@@ -387,7 +463,7 @@ mod tests {
     fn test_jaro_bitparallel() {
         // Test bit-parallel gives same result as standard
         let sim1 = jaro_bitparallel_ascii(b"MARTHA", b"MARHTA");
-        let sim2 = jaro_standard_ascii(b"MARTHA", b"MARHTA");
+        let sim2 = jaro_multiblock_ascii(b"MARTHA", b"MARHTA");
         assert!((sim1 - sim2).abs() < 0.001);
     }
 }

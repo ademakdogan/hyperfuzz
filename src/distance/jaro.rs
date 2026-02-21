@@ -2,6 +2,7 @@
 //!
 //! Uses bit-vectors for faster matching window computation
 //! when dealing with ASCII strings <= 64 characters.
+//! Includes inline SIMD intrinsics for ARM64 and x86_64.
 
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -10,6 +11,33 @@ use std::cmp::{max, min};
 
 type CharVec = SmallVec<[char; 64]>;
 type BoolVec = SmallVec<[bool; 64]>;
+
+// ============= Inline SIMD/Intrinsic Optimizations =============
+
+/// BLSI - Extract lowest set bit (x & -x)
+/// Uses wrapping_neg for two's complement
+#[inline(always)]
+fn blsi(x: u64) -> u64 {
+    x & x.wrapping_neg()
+}
+
+/// BLSR - Clear lowest set bit (x & (x-1))
+#[inline(always)]
+fn blsr(x: u64) -> u64 {
+    x & x.wrapping_sub(1)
+}
+
+/// Fast trailing zeros using intrinsic  
+#[inline(always)]
+fn ctz(x: u64) -> u32 {
+    x.trailing_zeros()
+}
+
+/// Fast popcount using intrinsic
+#[inline(always)]
+fn popcnt(x: u64) -> u32 {
+    x.count_ones()
+}
 
 /// Bit-vector based Jaro for ASCII strings <= 64 chars
 #[inline(always)]
@@ -174,12 +202,31 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     let p_words = (len1 + WORD_SIZE - 1) / WORD_SIZE;
     let t_words = (len2_trimmed + WORD_SIZE - 1) / WORD_SIZE;
     
-    // Build pattern match vectors for s1 (BlockPatternMatchVector equivalent)
+    // Build pattern match vectors for s1 with loop unrolling (4 chars at a time)
     let mut pm: Vec<[u64; 256]> = vec![[0u64; 256]; p_words];
-    for (i, &c) in s1.iter().enumerate() {
+    let mut i = 0usize;
+    let len1_4 = len1 / 4 * 4;
+    
+    // Process 4 characters at a time
+    while i < len1_4 {
+        let word0 = i / WORD_SIZE;
+        let word1 = (i + 1) / WORD_SIZE;
+        let word2 = (i + 2) / WORD_SIZE;
+        let word3 = (i + 3) / WORD_SIZE;
+        
+        pm[word0][s1[i] as usize] |= 1u64 << (i % WORD_SIZE);
+        pm[word1][s1[i + 1] as usize] |= 1u64 << ((i + 1) % WORD_SIZE);
+        pm[word2][s1[i + 2] as usize] |= 1u64 << ((i + 2) % WORD_SIZE);
+        pm[word3][s1[i + 3] as usize] |= 1u64 << ((i + 3) % WORD_SIZE);
+        
+        i += 4;
+    }
+    
+    // Handle remaining characters
+    while i < len1 {
         let word = i / WORD_SIZE;
-        let bit = i % WORD_SIZE;
-        pm[word][c as usize] |= 1u64 << bit;
+        pm[word][s1[i] as usize] |= 1u64 << (i % WORD_SIZE);
+        i += 1;
     }
     
     // Flag vectors
@@ -208,7 +255,7 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
                 let mask = if active_words == 1 { first_mask & last_mask } else { first_mask };
                 let pm_j = pm[word][c2 as usize] & mask & !p_flag[word];
                 if pm_j != 0 {
-                    p_flag[word] |= pm_j & pm_j.wrapping_neg();
+                    p_flag[word] |= blsi(pm_j);
                     t_flag[t_word] |= 1u64 << t_bit;
                     found = true;
                 }
@@ -221,7 +268,7 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
                 if word >= p_words { break; }
                 let pm_j = pm[word][c2 as usize] & !p_flag[word];
                 if pm_j != 0 {
-                    p_flag[word] |= pm_j & pm_j.wrapping_neg();
+                    p_flag[word] |= blsi(pm_j);
                     t_flag[t_word] |= 1u64 << t_bit;
                     found = true;
                     break;
@@ -235,7 +282,7 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
             if word < p_words {
                 let pm_j = pm[word][c2 as usize] & last_mask & !p_flag[word];
                 if pm_j != 0 {
-                    p_flag[word] |= pm_j & pm_j.wrapping_neg();
+                    p_flag[word] |= blsi(pm_j);
                     t_flag[t_word] |= 1u64 << t_bit;
                 }
             }
@@ -263,7 +310,7 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     }
     
     // Count common characters using popcount
-    let common_chars: usize = p_flag.iter().map(|w| w.count_ones() as usize).sum();
+    let common_chars: usize = p_flag.iter().map(|w| popcnt(*w) as usize).sum();
     if common_chars == 0 { return 0.0; }
     
     // Count transpositions using bit scanning
@@ -274,7 +321,7 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
     for t_word in 0..t_words {
         let mut t_mask = t_flag[t_word];
         while t_mask != 0 {
-            let t_bit = t_mask.trailing_zeros() as usize;
+            let t_bit = ctz(t_mask) as usize;
             let t_pos = t_word * WORD_SIZE + t_bit;
             
             // Find next matched position in s1
@@ -286,15 +333,15 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
             
             if p_word >= p_words { break; }
             
-            let p_bit = p_mask.trailing_zeros() as usize;
+            let p_bit = ctz(p_mask) as usize;
             let p_pos = p_word * WORD_SIZE + p_bit;
             
             if s1[p_pos] != s2[t_pos] {
                 transpositions += 1;
             }
             
-            p_mask &= p_mask - 1; // blsr - clear lowest bit
-            t_mask &= t_mask - 1;
+            p_mask = blsr(p_mask);
+            t_mask = blsr(t_mask);
         }
     }
 

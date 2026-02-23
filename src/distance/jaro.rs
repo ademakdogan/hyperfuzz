@@ -249,16 +249,18 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
         let mut found = false;
         
         // First word (may be partially masked)
-        if active_words >= 1 && !found {
+        if active_words >= 1 {
             let word = empty_words;
             if word < p_words {
                 let mask = if active_words == 1 { first_mask & last_mask } else { first_mask };
-                // SAFETY: word < p_words is checked above, c2 is always valid u8 index
-                let pm_j = unsafe { *pm.get_unchecked(word).get_unchecked(c2 as usize) } & mask & !p_flag[word];
-                if pm_j != 0 {
-                    p_flag[word] |= blsi(pm_j);
-                    t_flag[t_word] |= 1u64 << t_bit;
-                    found = true;
+                // SAFETY: all indices verified by bounds checks
+                unsafe {
+                    let pm_j = *pm.get_unchecked(word).get_unchecked(c2 as usize) & mask & !*p_flag.get_unchecked(word);
+                    if pm_j != 0 {
+                        *p_flag.get_unchecked_mut(word) |= blsi(pm_j);
+                        *t_flag.get_unchecked_mut(t_word) |= 1u64 << t_bit;
+                        found = true;
+                    }
                 }
             }
         }
@@ -267,12 +269,14 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
         if !found && active_words > 2 {
             for word in (empty_words + 1)..(empty_words + active_words - 1) {
                 if word >= p_words { break; }
-                let pm_j = unsafe { *pm.get_unchecked(word).get_unchecked(c2 as usize) } & !p_flag[word];
-                if pm_j != 0 {
-                    p_flag[word] |= blsi(pm_j);
-                    t_flag[t_word] |= 1u64 << t_bit;
-                    found = true;
-                    break;
+                unsafe {
+                    let pm_j = *pm.get_unchecked(word).get_unchecked(c2 as usize) & !*p_flag.get_unchecked(word);
+                    if pm_j != 0 {
+                        *p_flag.get_unchecked_mut(word) |= blsi(pm_j);
+                        *t_flag.get_unchecked_mut(t_word) |= 1u64 << t_bit;
+                        found = true;
+                        break;
+                    }
                 }
             }
         }
@@ -281,10 +285,12 @@ fn jaro_multiblock_ascii(s1: &[u8], s2: &[u8]) -> f64 {
         if !found && active_words >= 2 {
             let word = empty_words + active_words - 1;
             if word < p_words {
-                let pm_j = unsafe { *pm.get_unchecked(word).get_unchecked(c2 as usize) } & last_mask & !p_flag[word];
-                if pm_j != 0 {
-                    p_flag[word] |= blsi(pm_j);
-                    t_flag[t_word] |= 1u64 << t_bit;
+                unsafe {
+                    let pm_j = *pm.get_unchecked(word).get_unchecked(c2 as usize) & last_mask & !*p_flag.get_unchecked(word);
+                    if pm_j != 0 {
+                        *p_flag.get_unchecked_mut(word) |= blsi(pm_j);
+                        *t_flag.get_unchecked_mut(t_word) |= 1u64 << t_bit;
+                    }
                 }
             }
         }

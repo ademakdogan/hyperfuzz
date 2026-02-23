@@ -20,31 +20,63 @@ fn tokenize<'a>(s: &'a str) -> TokenVec<'a> {
     s.split_whitespace().collect()
 }
 
-/// Efficient join with pre-allocated capacity
+/// Ultra-fast join with unsafe memory operations
 #[inline(always)]
 fn join_tokens(tokens: &[&str]) -> String {
     if tokens.is_empty() { return String::new(); }
     if tokens.len() == 1 { return tokens[0].to_string(); }
     
+    // Pre-calculate exact capacity
     let capacity: usize = tokens.iter().map(|t| t.len()).sum::<usize>() + tokens.len() - 1;
+    
+    // Allocate and fill using unsafe
     let mut result = String::with_capacity(capacity);
-    result.push_str(tokens[0]);
-    for t in &tokens[1..] {
-        result.push(' ');
-        result.push_str(t);
+    
+    unsafe {
+        let buf = result.as_mut_vec();
+        buf.set_len(capacity);
+        let ptr = buf.as_mut_ptr();
+        let mut offset = 0;
+        
+        // Copy first token
+        std::ptr::copy_nonoverlapping(tokens[0].as_ptr(), ptr, tokens[0].len());
+        offset += tokens[0].len();
+        
+        // Copy remaining with spaces
+        for t in &tokens[1..] {
+            *ptr.add(offset) = b' ';
+            offset += 1;
+            std::ptr::copy_nonoverlapping(t.as_ptr(), ptr.add(offset), t.len());
+            offset += t.len();
+        }
     }
+    
     result
 }
 
-/// Fast ratio
+/// Fast ratio using unsafe byte operations
 #[inline(always)]
 fn ratio_internal(s1: &str, s2: &str) -> f64 {
-    if s1 == s2 { return 100.0; }
     if s1.is_empty() && s2.is_empty() { return 100.0; }
     if s1.is_empty() || s2.is_empty() { return 0.0; }
+    if s1 == s2 { return 100.0; }
     
-    let len1 = if s1.is_ascii() { s1.len() } else { s1.chars().count() };
-    let len2 = if s2.is_ascii() { s2.len() } else { s2.chars().count() };
+    // For ASCII strings, use direct byte comparison
+    if s1.is_ascii() && s2.is_ascii() {
+        let b1 = s1.as_bytes();
+        let b2 = s2.as_bytes();
+        let len1 = b1.len();
+        let len2 = b2.len();
+        let lensum = len1 + len2;
+        
+        // Direct call to optimized LCS
+        let lcs = crate::lcs_core::lcs_bitparallel_multiblock(b1, b2);
+        return 100.0 * (2 * lcs) as f64 / lensum as f64;
+    }
+    
+    // Non-ASCII fallback
+    let len1 = s1.chars().count();
+    let len2 = s2.chars().count();
     let lcs = lcs_fast(s1, s2);
     
     ratio_from_lcs(len1, len2, lcs)

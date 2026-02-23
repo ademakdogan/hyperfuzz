@@ -7,7 +7,7 @@ use rayon::prelude::*;
 
 use crate::lcs_core::{lcs_fast, ratio_from_lcs};
 
-/// Calculate ratio using lcs_core optimizations
+/// Calculate ratio using lcs_core optimizations - Ultra optimized for ASCII
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
@@ -16,14 +16,36 @@ pub fn ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
     if s1.is_empty() && s2.is_empty() { return 100.0; }
     if s1.is_empty() || s2.is_empty() { return 0.0; }
     
-    // Get lengths efficiently
-    let (len1, len2) = if s1.is_ascii() && s2.is_ascii() {
-        (s1.len(), s2.len())
-    } else {
-        (s1.chars().count(), s2.chars().count())
-    };
+    // ASCII fast path - direct byte-level LCS
+    if s1.is_ascii() && s2.is_ascii() {
+        let b1 = s1.as_bytes();
+        let b2 = s2.as_bytes();
+        let len1 = b1.len();
+        let len2 = b2.len();
+        let lensum = len1 + len2;
+        
+        // Early rejection based on length ratio
+        if let Some(cutoff) = score_cutoff {
+            let max_possible = 100.0 * (2.0 * len1.min(len2) as f64) / (lensum as f64);
+            if max_possible < cutoff {
+                return 0.0;
+            }
+        }
+        
+        // Direct call to optimized byte-level LCS
+        let lcs = crate::lcs_core::lcs_bitparallel_multiblock(b1, b2);
+        let similarity = 100.0 * (2 * lcs) as f64 / lensum as f64;
+        
+        return match score_cutoff {
+            Some(cutoff) if similarity < cutoff => 0.0,
+            _ => similarity,
+        };
+    }
     
-    // Early rejection based on length ratio
+    // Non-ASCII fallback
+    let len1 = s1.chars().count();
+    let len2 = s2.chars().count();
+    
     if let Some(cutoff) = score_cutoff {
         let max_possible = 100.0 * (2.0 * len1.min(len2) as f64) / ((len1 + len2) as f64);
         if max_possible < cutoff {

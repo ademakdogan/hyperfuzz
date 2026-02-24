@@ -65,6 +65,11 @@ pub fn lcs_bitparallel_multiblock(s1: &[u8], s2: &[u8]) -> usize {
         return lcs_bitparallel_2block(s1, s2);
     }
     
+    // Use specialized 3-block version for 129-192 chars (stack allocated) - optimal for Test 12!
+    if len1 <= 192 {
+        return lcs_bitparallel_3block(s1, s2);
+    }
+    
     // General multi-block for > 128 chars
     let num_blocks = (len1 + 63) / 64;
     let mut block_maps: Vec<[u64; 256]> = vec![[0u64; 256]; num_blocks];
@@ -156,6 +161,68 @@ fn lcs_bitparallel_2block(s1: &[u8], s2: &[u8]) -> usize {
     lcs0 + lcs1
 }
 
+/// Specialized 3-block LCS for strings 129-192 chars (full stack allocation)
+/// Optimized for Test 12 (184 chars) - eliminates Vec overhead
+#[inline(always)]
+fn lcs_bitparallel_3block(s1: &[u8], s2: &[u8]) -> usize {
+    let len1 = s1.len();
+    
+    // Stack-allocated block maps (3 blocks × 256 entries)
+    let mut block0: [u64; 256] = [0u64; 256];
+    let mut block1: [u64; 256] = [0u64; 256];
+    let mut block2: [u64; 256] = [0u64; 256];
+    
+    for (i, &c) in s1.iter().enumerate() {
+        if i < 64 {
+            block0[c as usize] |= 1u64 << i;
+        } else if i < 128 {
+            block1[c as usize] |= 1u64 << (i - 64);
+        } else {
+            block2[c as usize] |= 1u64 << (i - 128);
+        }
+    }
+    
+    // Stack-allocated state (3 × u64)
+    let mut s0: u64 = !0u64;
+    let mut s1_state: u64 = !0u64;
+    let mut s2_state: u64 = !0u64;
+    
+    for &c2 in s2.iter() {
+        // Block 0
+        let matches0 = block0[c2 as usize];
+        let u0 = s0 & matches0;
+        let (sum0, overflow0) = s0.overflowing_add(u0);
+        s0 = sum0 | (s0.wrapping_sub(u0));
+        let mut carry = overflow0 as u64;
+        
+        // Block 1 (with carry from block 0)
+        let matches1 = block1[c2 as usize];
+        let u1 = s1_state & matches1;
+        let (sum1, overflow1) = s1_state.overflowing_add(u1);
+        let sum1_carry = sum1.wrapping_add(carry);
+        let overflow1b = sum1_carry < sum1;
+        s1_state = sum1_carry | (s1_state.wrapping_sub(u1));
+        carry = (overflow1 || overflow1b) as u64;
+        
+        // Block 2 (with carry from block 1)
+        let matches2 = block2[c2 as usize];
+        let u2 = s2_state & matches2;
+        let (sum2, _) = s2_state.overflowing_add(u2);
+        let sum2_carry = sum2.wrapping_add(carry);
+        s2_state = sum2_carry | (s2_state.wrapping_sub(u2));
+    }
+    
+    // Count LCS
+    let len_block2 = len1 - 128;
+    
+    let mask2 = if len_block2 == 64 { !0u64 } else { (1u64 << len_block2) - 1 };
+    
+    let lcs0 = 64 - s0.count_ones() as usize;
+    let lcs1 = 64 - s1_state.count_ones() as usize;
+    let lcs2 = len_block2 - (s2_state & mask2).count_ones() as usize;
+    
+    lcs0 + lcs1 + lcs2
+}
 /// Compute LCS using pre-built block map (for sliding window operations)
 #[inline(always)]
 pub fn lcs_with_block(block: &[u64; 256], len1: usize, s2: &[u8]) -> usize {

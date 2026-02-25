@@ -124,21 +124,44 @@ pub fn token_sort_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
     }
 }
 
-/// Token set ratio - RapidFuzz algorithm with mathematical shortcuts
+/// Token set ratio - Ultra optimized with inline set operations and direct byte LCS
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
     if s1 == s2 { return 100.0; }
+    if s1.is_empty() && s2.is_empty() { return 100.0; }
+    if s1.is_empty() || s2.is_empty() { return 0.0; }
     
-    let tokens1: AHashSet<&str> = tokenize(s1).into_iter().collect();
-    let tokens2: AHashSet<&str> = tokenize(s2).into_iter().collect();
+    // Tokenize once
+    let tokens1 = tokenize(s1);
+    let tokens2 = tokenize(s2);
     
-    if tokens1 == tokens2 { return 100.0; }
+    if tokens1.is_empty() && tokens2.is_empty() { return 100.0; }
     if tokens1.is_empty() || tokens2.is_empty() { return 0.0; }
     
-    let intersect: AHashSet<&str> = tokens1.intersection(&tokens2).copied().collect();
-    let diff_ab: TokenVec = tokens1.difference(&tokens2).copied().collect();
-    let diff_ba: TokenVec = tokens2.difference(&tokens1).copied().collect();
+    // Build sets inline without allocation
+    let set1: AHashSet<&str> = tokens1.iter().copied().collect();
+    let set2: AHashSet<&str> = tokens2.iter().copied().collect();
+    
+    if set1 == set2 { return 100.0; }
+    
+    // Calculate differences inline - no clone, direct iteration
+    let mut diff_ab: SmallVec<[&str; 16]> = SmallVec::new();
+    let mut diff_ba: SmallVec<[&str; 16]> = SmallVec::new();
+    let mut intersect: SmallVec<[&str; 16]> = SmallVec::new();
+    
+    for &t in set1.iter() {
+        if set2.contains(t) {
+            intersect.push(t);
+        } else {
+            diff_ab.push(t);
+        }
+    }
+    for &t in set2.iter() {
+        if !set1.contains(t) {
+            diff_ba.push(t);
+        }
+    }
     
     // KEY OPTIMIZATION: One sentence is part of the other
     if !intersect.is_empty() && (diff_ab.is_empty() || diff_ba.is_empty()) {
@@ -147,32 +170,31 @@ pub fn token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
     
     let score_cutoff = score_cutoff.unwrap_or(0.0);
     
-    // Sort differences
-    let mut diff_ab_sorted: TokenVec = diff_ab.clone();
-    let mut diff_ba_sorted: TokenVec = diff_ba.clone();
-    diff_ab_sorted.sort_unstable();
-    diff_ba_sorted.sort_unstable();
+    // Sort differences inline
+    diff_ab.sort_unstable();
+    diff_ba.sort_unstable();
     
-    let diff_ab_joined = join_tokens(&diff_ab_sorted);
-    let diff_ba_joined = join_tokens(&diff_ba_sorted);
+    // Calculate lengths without string allocation - use chars().count() for Unicode correctness
+    let ab_len: usize = diff_ab.iter().map(|t| t.chars().count()).sum::<usize>() + diff_ab.len().saturating_sub(1);
+    let ba_len: usize = diff_ba.iter().map(|t| t.chars().count()).sum::<usize>() + diff_ba.len().saturating_sub(1);
+    let sect_len: usize = intersect.iter().map(|t| t.chars().count()).sum::<usize>() + intersect.len().saturating_sub(1);
     
-    let ab_len = diff_ab_joined.chars().count();
-    let ba_len = diff_ba_joined.chars().count();
+    // String lengths for ratio calculations
+    let sect_ab_len = sect_len + if sect_len != 0 && ab_len != 0 { 1 } else { 0 } + ab_len;
+    let sect_ba_len = sect_len + if sect_len != 0 && ba_len != 0 { 1 } else { 0 } + ba_len;
     
-    // Calculate sect_len (intersection string length)
-    let sect_len: usize = if intersect.is_empty() {
-        0
+    // Calculate distance between diff strings - now using direct byte comparison
+    let diff_ab_joined = join_tokens(&diff_ab);
+    let diff_ba_joined = join_tokens(&diff_ba);
+    
+    // Direct byte-level LCS for ASCII
+    let dist = if diff_ab_joined.is_ascii() && diff_ba_joined.is_ascii() {
+        let lcs = crate::lcs_core::lcs_bitparallel_multiblock(diff_ab_joined.as_bytes(), diff_ba_joined.as_bytes());
+        ab_len + ba_len - 2 * lcs
     } else {
-        let inter_vec: TokenVec = intersect.iter().copied().collect();
-        join_tokens(&inter_vec).chars().count()
+        indel_dist(&diff_ab_joined, &diff_ba_joined)
     };
     
-    // String lengths: sect+ab <-> sect and sect+ba <-> sect
-    let sect_ab_len = sect_len + if sect_len != 0 { 1 } else { 0 } + ab_len;
-    let sect_ba_len = sect_len + if sect_len != 0 { 1 } else { 0 } + ba_len;
-    
-    // Calculate distance between diff strings
-    let dist = indel_dist(&diff_ab_joined, &diff_ba_joined);
     let mut result = norm_distance(dist, sect_ab_len + sect_ba_len, score_cutoff);
     
     // Exit early if no intersection
@@ -180,34 +202,114 @@ pub fn token_set_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
         return result;
     }
     
-    // Mathematical shortcuts for sect+ab <-> sect and sect+ba <-> sect
-    let sect_ab_dist = if sect_len != 0 { 1 } else { 0 } + ab_len;
+    // Mathematical shortcuts - avoid extra string operations
+    let sect_ab_dist = if sect_len != 0 && ab_len != 0 { 1 } else { 0 } + ab_len;
     let sect_ab_ratio = norm_distance(sect_ab_dist, sect_len + sect_ab_len, score_cutoff);
     
-    let sect_ba_dist = if sect_len != 0 { 1 } else { 0 } + ba_len;
+    let sect_ba_dist = if sect_len != 0 && ba_len != 0 { 1 } else { 0 } + ba_len;
     let sect_ba_ratio = norm_distance(sect_ba_dist, sect_len + sect_ba_len, score_cutoff);
     
     result = result.max(sect_ab_ratio).max(sect_ba_ratio);
     result
 }
 
-/// Token ratio - max of sort and set
+/// Token ratio - Ultra optimized with fully inlined set calculation
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, score_cutoff=None))]
 pub fn token_ratio(s1: &str, s2: &str, score_cutoff: Option<f64>) -> f64 {
     if s1 == s2 { return 100.0; }
+    if s1.is_empty() && s2.is_empty() { return 100.0; }
+    if s1.is_empty() || s2.is_empty() { return 0.0; }
     
-    // token_set_ratio often returns 100 early, check it first
-    let set_result = token_set_ratio(s1, s2, None);
-    if set_result >= 100.0 {
-        return match score_cutoff {
-            Some(cutoff) if set_result < cutoff => 0.0,
-            _ => set_result,
-        };
+    // Tokenize once and reuse for both set and sort
+    let mut tokens1 = tokenize(s1);
+    let mut tokens2 = tokenize(s2);
+    
+    if tokens1.is_empty() && tokens2.is_empty() { return 100.0; }
+    if tokens1.is_empty() || tokens2.is_empty() { return 0.0; }
+    
+    // Quick set equality check
+    let set1: AHashSet<&str> = tokens1.iter().copied().collect();
+    let set2: AHashSet<&str> = tokens2.iter().copied().collect();
+    if set1 == set2 { return 100.0; }
+    
+    // Calculate differences inline (reuse for set_ratio)
+    let mut diff_ab: SmallVec<[&str; 16]> = SmallVec::new();
+    let mut diff_ba: SmallVec<[&str; 16]> = SmallVec::new();
+    let mut intersect: SmallVec<[&str; 16]> = SmallVec::new();
+    
+    for &t in set1.iter() {
+        if set2.contains(t) {
+            intersect.push(t);
+        } else {
+            diff_ab.push(t);
+        }
+    }
+    for &t in set2.iter() {
+        if !set1.contains(t) {
+            diff_ba.push(t);
+        }
     }
     
-    let sort_result = token_sort_ratio(s1, s2, None);
-    let result = set_result.max(sort_result);
+    // Early exit: one is subset of other
+    if !intersect.is_empty() && (diff_ab.is_empty() || diff_ba.is_empty()) {
+        return 100.0;
+    }
+    
+    // Calculate token_sort_ratio inline
+    tokens1.sort_unstable();
+    tokens2.sort_unstable();
+    
+    let sort_result = if tokens1 == tokens2 {
+        100.0
+    } else {
+        let sorted1 = join_tokens(&tokens1);
+        let sorted2 = join_tokens(&tokens2);
+        ratio_internal(&sorted1, &sorted2)
+    };
+    
+    // Calculate token_set_ratio inline (using already computed differences)
+    diff_ab.sort_unstable();
+    diff_ba.sort_unstable();
+    
+    let ab_len: usize = diff_ab.iter().map(|t| t.chars().count()).sum::<usize>() + diff_ab.len().saturating_sub(1);
+    let ba_len: usize = diff_ba.iter().map(|t| t.chars().count()).sum::<usize>() + diff_ba.len().saturating_sub(1);
+    let sect_len: usize = intersect.iter().map(|t| t.chars().count()).sum::<usize>() + intersect.len().saturating_sub(1);
+    
+    let sect_ab_len = sect_len + if sect_len != 0 && ab_len != 0 { 1 } else { 0 } + ab_len;
+    let sect_ba_len = sect_len + if sect_len != 0 && ba_len != 0 { 1 } else { 0 } + ba_len;
+    
+    let set_result = if sect_len == 0 {
+        // Only compare diff strings
+        let diff_ab_joined = join_tokens(&diff_ab);
+        let diff_ba_joined = join_tokens(&diff_ba);
+        let dist = if diff_ab_joined.is_ascii() && diff_ba_joined.is_ascii() {
+            let lcs = crate::lcs_core::lcs_bitparallel_multiblock(diff_ab_joined.as_bytes(), diff_ba_joined.as_bytes());
+            ab_len + ba_len - 2 * lcs
+        } else {
+            indel_dist(&diff_ab_joined, &diff_ba_joined)
+        };
+        norm_distance(dist, sect_ab_len + sect_ba_len, 0.0)
+    } else {
+        // Calculate full set ratio with mathematical shortcuts
+        let diff_ab_joined = join_tokens(&diff_ab);
+        let diff_ba_joined = join_tokens(&diff_ba);
+        let dist = if diff_ab_joined.is_ascii() && diff_ba_joined.is_ascii() {
+            let lcs = crate::lcs_core::lcs_bitparallel_multiblock(diff_ab_joined.as_bytes(), diff_ba_joined.as_bytes());
+            ab_len + ba_len - 2 * lcs
+        } else {
+            indel_dist(&diff_ab_joined, &diff_ba_joined)
+        };
+        
+        let r1 = norm_distance(dist, sect_ab_len + sect_ba_len, 0.0);
+        let sect_ab_dist = if sect_len != 0 && ab_len != 0 { 1 } else { 0 } + ab_len;
+        let r2 = norm_distance(sect_ab_dist, sect_len + sect_ab_len, 0.0);
+        let sect_ba_dist = if sect_len != 0 && ba_len != 0 { 1 } else { 0 } + ba_len;
+        let r3 = norm_distance(sect_ba_dist, sect_len + sect_ba_len, 0.0);
+        r1.max(r2).max(r3)
+    };
+    
+    let result = sort_result.max(set_result);
     
     match score_cutoff {
         Some(cutoff) if result < cutoff => 0.0,

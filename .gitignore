@@ -32,6 +32,5 @@ env/
 htmlcov/
 
 # Cargo
-Cargo.lock
 rapidfuzz-rs-main/
 RapidFuzz-main/

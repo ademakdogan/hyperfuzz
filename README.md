@@ -12,15 +12,19 @@ HyperFuzz is a Python library providing blazing-fast string similarity calculati
 
 ## 📦 Installation
 
+> **Requires:** Rust toolchain (`rustc` + `cargo`). Install via [rustup](https://rustup.rs/) if not already available.
+
 ```bash
-pip install hyperfuzz
+pip install git+https://github.com/ademakdogan/hyperfuzz.git
 ```
 
-> **Build from source** (requires Rust toolchain + maturin):
-> ```bash
-> pip install maturin
-> maturin develop --release
-> ```
+**Build from source** (for development):
+```bash
+git clone https://github.com/ademakdogan/hyperfuzz.git
+cd hyperfuzz
+pip install maturin
+maturin develop --release
+```
 
 ---
 
@@ -40,7 +44,96 @@ score = fuzz.token_sort_ratio("fuzzy wuzzy", "wuzzy fuzzy")     # 100.0
 
 ---
 
-## 📖 API Reference
+## ⚡ Performance: HyperFuzz vs RapidFuzz
+
+All benchmarks run with **10,000 iterations** per test case on Python 3.13.
+
+### Fuzz — Short Text
+
+Average speedup per algorithm on short text pairs (names, IDs, emails; < 25 chars):
+
+| Algorithm | Avg Speedup |
+|-----------|-------------|
+| `fuzz.ratio` | **2.20x** |
+| `fuzz.partial_ratio` | **2.88x** |
+| `fuzz.token_sort_ratio` | **3.22x** |
+| `fuzz.token_set_ratio` | **3.13x** |
+| `fuzz.token_ratio` | **2.86x** |
+| `fuzz.partial_token_sort_ratio` | **4.26x** |
+| `fuzz.partial_token_set_ratio` | **2.64x** |
+| `fuzz.partial_token_ratio` | **2.73x** |
+| `fuzz.WRatio` | **2.01x** |
+| `fuzz.QRatio` | **2.18x** |
+
+### Fuzz — Long Text
+
+Average speedup per algorithm on long text pairs (paragraphs; 60–220 chars):
+
+| Algorithm | Avg Speedup |
+|-----------|-------------|
+| `fuzz.ratio` | **1.19x** |
+| `fuzz.partial_ratio` | **2.67x** |
+| `fuzz.token_sort_ratio` | **1.29x** |
+| `fuzz.token_set_ratio` | **1.24x** |
+| `fuzz.token_ratio` | **1.10x** |
+| `fuzz.partial_token_sort_ratio` | **2.64x** |
+| `fuzz.partial_token_set_ratio` | **1.97x** |
+| `fuzz.partial_token_ratio` | **2.09x** |
+| `fuzz.WRatio` | **1.06x** |
+| `fuzz.QRatio` | **1.16x** |
+
+### Overall
+
+| Metric | Value |
+|--------|-------|
+| **Avg Speedup (Short Text)** | **2.82x** 🚀 |
+| **Avg Speedup (Long Text)** | **1.64x** 🚀 |
+| **Overall Fuzz Avg Speedup** | **2.43x** 🚀 |
+
+> Benchmark source: 252 test cases covering 8 short + 4 long text pair scenarios across 21 algorithms.
+
+---
+
+## 🏗️ Architecture
+
+```
+hyperfuzz
+├── distance               # Edit distance metrics
+│   ├── levenshtein        #   Myers' bit-parallel O(n·m/64)
+│   ├── damerau_levenshtein#   Full DL with transpositions
+│   ├── osa                #   Optimal String Alignment
+│   ├── hamming            #   Position-wise comparison
+│   ├── jaro               #   Character-matching metric
+│   ├── jaro_winkler       #   Prefix-weighted Jaro
+│   ├── indel              #   Insert/Delete only
+│   ├── lcs_seq            #   Longest Common Subsequence
+│   ├── lcs_str            #   Longest Common Substring
+│   ├── prefix             #   Common prefix length
+│   └── postfix            #   Common suffix length
+├── fuzz                   # Fuzzy matching (0–100 scale)
+│   ├── ratio              #   Full-string LCS ratio
+│   ├── partial_ratio      #   Best-substring ratio
+│   ├── token_sort_ratio   #   Sorted-token ratio
+│   ├── token_set_ratio    #   Set-intersection ratio
+│   ├── token_ratio        #   Combined sort+set
+│   ├── partial_token_*    #   Partial variants
+│   ├── WRatio             #   Weighted auto-select
+│   └── QRatio             #   Quick ratio
+├── set_based              # Jaccard, Dice, Tversky, Overlap
+├── alignment              # Smith-Waterman, Needleman-Wunsch
+└── vector                 # Cosine similarity, Soft-TFIDF
+```
+
+**Key Rust Optimizations:**
+- 🧬 **Myers' bit-parallel** — O(n·m/64) Levenshtein via 64-bit SIMD-style word operations
+- � **Thread-local buffers** — zero-allocation LCS via `thread_local!` reusable buffers
+- ⚡ **Rayon parallelism** — all `_batch` operations auto-distribute across CPU cores
+- 🏎️ **ASCII fast paths** — byte-level operations bypass expensive Unicode iteration
+- 📦 **SmallVec / ahash** — stack-allocated token vectors and fast hash maps
+
+---
+
+## �📖 API Reference
 
 HyperFuzz exposes **five algorithm families**. Every function accepts an optional `score_cutoff` keyword argument; if the result is below the cutoff the function returns `0` (or `0.0`). All batch variants accept `pairs: list[tuple[str, str]]` and run on **Rayon thread-pool** for parallel processing.
 
@@ -536,97 +629,6 @@ soft_tfidf_similarity_batch(
     threshold=0.8
 )
 ```
-
----
-
-## ⚡ Performance: HyperFuzz vs RapidFuzz
-
-All benchmarks run with **10,000 iterations** per test case on Python 3.13.
-
-### Fuzz — Short Text
-
-Average speedup per algorithm on short text pairs (names, IDs, emails; < 25 chars):
-
-| Algorithm | Avg Speedup |
-|-----------|-------------|
-| `fuzz.ratio` | **2.20x** |
-| `fuzz.partial_ratio` | **2.88x** |
-| `fuzz.token_sort_ratio` | **3.22x** |
-| `fuzz.token_set_ratio` | **3.13x** |
-| `fuzz.token_ratio` | **2.86x** |
-| `fuzz.partial_token_sort_ratio` | **4.26x** |
-| `fuzz.partial_token_set_ratio` | **2.64x** |
-| `fuzz.partial_token_ratio` | **2.73x** |
-| `fuzz.WRatio` | **2.01x** |
-| `fuzz.QRatio` | **2.18x** |
-
-### Fuzz — Long Text
-
-Average speedup per algorithm on long text pairs (paragraphs; 60–220 chars):
-
-| Algorithm | Avg Speedup |
-|-----------|-------------|
-| `fuzz.ratio` | **1.19x** |
-| `fuzz.partial_ratio` | **2.67x** |
-| `fuzz.token_sort_ratio` | **1.29x** |
-| `fuzz.token_set_ratio` | **1.24x** |
-| `fuzz.token_ratio` | **1.10x** |
-| `fuzz.partial_token_sort_ratio` | **2.64x** |
-| `fuzz.partial_token_set_ratio` | **1.97x** |
-| `fuzz.partial_token_ratio` | **2.09x** |
-| `fuzz.WRatio` | **1.06x** |
-| `fuzz.QRatio` | **1.16x** |
-
-### Overall
-
-| Metric | Value |
-|--------|-------|
-| Score Accuracy | **98.8%** (249/252) |
-| HyperFuzz Faster | **81.3%** of test cases |
-| **Avg Speedup (Short Text)** | **2.82x** 🚀 |
-| **Avg Speedup (Long Text)** | **1.64x** 🚀 |
-| **Overall Fuzz Avg Speedup** | **2.43x** 🚀 |
-
-> Benchmark source: 252 test cases covering 8 short + 4 long text pair scenarios across 21 algorithms.
-
----
-
-## 🏗️ Architecture
-
-```
-hyperfuzz
-├── distance               # Edit distance metrics
-│   ├── levenshtein        #   Myers' bit-parallel O(n·m/64)
-│   ├── damerau_levenshtein#   Full DL with transpositions
-│   ├── osa                #   Optimal String Alignment
-│   ├── hamming            #   Position-wise comparison
-│   ├── jaro               #   Character-matching metric
-│   ├── jaro_winkler       #   Prefix-weighted Jaro
-│   ├── indel              #   Insert/Delete only
-│   ├── lcs_seq            #   Longest Common Subsequence
-│   ├── lcs_str            #   Longest Common Substring
-│   ├── prefix             #   Common prefix length
-│   └── postfix            #   Common suffix length
-├── fuzz                   # Fuzzy matching (0–100 scale)
-│   ├── ratio              #   Full-string LCS ratio
-│   ├── partial_ratio      #   Best-substring ratio
-│   ├── token_sort_ratio   #   Sorted-token ratio
-│   ├── token_set_ratio    #   Set-intersection ratio
-│   ├── token_ratio        #   Combined sort+set
-│   ├── partial_token_*    #   Partial variants
-│   ├── WRatio             #   Weighted auto-select
-│   └── QRatio             #   Quick ratio
-├── set_based              # Jaccard, Dice, Tversky, Overlap
-├── alignment              # Smith-Waterman, Needleman-Wunsch
-└── vector                 # Cosine similarity, Soft-TFIDF
-```
-
-**Key Rust Optimizations:**
-- 🧬 **Myers' bit-parallel** — O(n·m/64) Levenshtein via 64-bit SIMD-style word operations
-- 🔄 **Thread-local buffers** — zero-allocation LCS via `thread_local!` reusable buffers
-- ⚡ **Rayon parallelism** — all `_batch` operations auto-distribute across CPU cores
-- 🏎️ **ASCII fast paths** — byte-level operations bypass expensive Unicode iteration
-- 📦 **SmallVec / ahash** — stack-allocated token vectors and fast hash maps
 
 ---
 

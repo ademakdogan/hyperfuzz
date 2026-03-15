@@ -13,11 +13,19 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Topic :: Text Processing :: General",
+    "Topic :: Text Processing :: Linguistic",
+    "Operating System :: OS Independent",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ademakdogan/hyperfuzz"
+Repository = "https://github.com/ademakdogan/hyperfuzz"
+Issues = "https://github.com/ademakdogan/hyperfuzz/issues"
 
 [project.optional-dependencies]
 dev = [

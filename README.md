@@ -12,11 +12,11 @@ HyperFuzz is a Python library providing blazing-fast string similarity calculati
 
 ## 📦 Installation
 
-> **Requires:** Rust toolchain (`rustc` + `cargo`). Install via [rustup](https://rustup.rs/) if not already available.
-
 ```bash
-pip install git+https://github.com/ademakdogan/hyperfuzz.git
+pip install hyperfuzz
 ```
+
+> **Note:** Pre-built wheels are available for select platforms. For other platforms, a Rust toolchain (`rustc` + `cargo`) is required. Install via [rustup](https://rustup.rs/) if not already available.
 
 **Build from source** (for development):
 ```bash
